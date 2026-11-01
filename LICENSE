@@ -1,10 +1,14 @@
 MIT License
 
-Copyright (c) 2026 Vladimir (humanizer-ru: SKILL.md, patterns.md, examples.md,
-check_facts.py, clean_paste.py)
-Copyright (c) 2026 anti-ai-skill contributors (diagnose.py and process additions)
-Copyright (c) 2026 redaktura-ru contributors (merge, references/measure.md,
-references/transcript.md, references/acceptance.md, signs 20-25)
+Copyright (c) 2026 redaktura-ru contributors
+Copyright (c) 2026 Vladimir
+Copyright (c) 2026 anti-ai-skill contributors
+
+redaktura-ru is a derivative work that includes portions of humanizer-ru
+(https://github.com/Vladimir-Human/humanizer-ru) and anti-ai-skill
+(https://github.com/artemiimillier/anti-ai-skill), both MIT. Each notice above
+applies to the portions created by its holder. The file-by-file mapping and the
+verbatim upstream notices are in NOTICE.md.
 
 Permission is hereby granted, free of charge, to any person obtaining a copy
 of this software and associated documentation files (the "Software"), to deal

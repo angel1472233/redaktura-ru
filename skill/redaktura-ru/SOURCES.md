@@ -9,7 +9,7 @@ How this skill was assembled and how to update it.
 | Base | `Vladimir-Human/humanizer-ru` | `c3240ed1349c54465a69eed3ae84592e960779ea` | 4.1.6 |
 | Additions | `artemiimillier/anti-ai-skill` | `0e05482c2537d699685f5225557237679af07574` | 2026-08-26 |
 
-Both sources are MIT. See the repository `LICENSE` and `NOTICE.md`.
+Both sources are MIT. See `LICENSE` and `NOTICE.md` in the repository root.
 
 The skill ID is `redaktura-ru`, not `humanizer-ru`. It does not conflict with
 the upstream skill: you can install both side by side.
@@ -47,3 +47,12 @@ and in the merge plan.
 
 Nothing. The base is the source of truth for facts, signs 1–19 and the seven
 editing steps.
+
+## License
+
+MIT. The full text is in `LICENSE` at the repository root; provenance and the
+degree of copying are in `NOTICE.md`.
+
+- `Copyright (c) 2026 redaktura-ru contributors`
+- `Copyright (c) 2026 Vladimir` (humanizer-ru)
+- `Copyright (c) 2026 anti-ai-skill contributors` (anti-ai-skill)
