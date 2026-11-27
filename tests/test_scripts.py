@@ -1,0 +1,1394 @@
+# -*- coding: utf-8 -*-
+# START_MODULE_CONTRACT
+# PURPOSE: Unit tests for the skill helpers: check_facts.py and clean_paste.py.
+# SCOPE: positive and negative cases for each kind of fact and artifact.
+# DEPENDS: unittest; scripts loaded by path from skills/humanizer-ru/scripts.
+# LINKS: V-M-CHECK-FACTS; V-M-CLEAN-PASTE.
+# END_MODULE_CONTRACT
+import importlib.util
+import itertools
+import random
+import subprocess
+import sys
+import tempfile
+import unittest
+from pathlib import Path
+
+ROOT = Path(__file__).resolve().parents[1]
+SCRIPTS = ROOT / "skill" / "redaktura-ru" / "scripts"
+
+
+def _load(name):
+    spec = importlib.util.spec_from_file_location(name, SCRIPTS / (name + ".py"))
+    mod = importlib.util.module_from_spec(spec)
+    sys.modules[name] = mod  # dataclasses look the module up while the class is built
+    spec.loader.exec_module(mod)
+    return mod
+
+
+cf = _load("check_facts")
+cp = _load("clean_paste")
+
+
+def kinds(result):
+    return sorted({e["kind"] for e in result["errors"]})
+
+
+class CheckFactsTest(unittest.TestCase):
+    def test_identical_text_is_clean(self):
+        text = "Анна получила 30 000 рублей 5 марта. Переводы на карту не принимаем."
+        self.assertEqual(cf.compare(text, text)["errors"], [])
+
+    def test_swapped_amounts_between_people(self):
+        a = "Анна получила 30 000 рублей. Борис получил 50 000 рублей."
+        b = "Анна получила 50 000 рублей. Борис получил 30 000 рублей."
+        self.assertIn("swap", kinds(cf.compare(a, b)))
+
+    def test_number_next_to_the_same_word_as_in_the_original_is_not_a_swap(self):
+        # final4 q03: the card was flagged even against itself.
+        card = "Термос объёмом 750 мл из стали 18/8.\n\n| Модель | Тропа 750 |\n| Материал | Сталь 18/8 |\n"
+        edit = "Термос на 750 мл, сталь 18/8.\n\n| Модель | Тропа 750 |\n| Материал | Сталь 18/8 |\n"
+        self.assertEqual(cf.compare(card, card)["errors"], [])
+        self.assertEqual(cf.compare(card, edit)["errors"], [])
+
+    def test_lost_and_added_numbers(self):
+        r = cf.compare("Ссылка действует 30 дней.", "Ссылка действует 45 дней.")
+        self.assertIn("lost", kinds(r))
+        self.assertIn("added", kinds(r))
+
+    def test_units_and_number_words_are_normalised(self):
+        a = "Капучино стоит 240 рублей, доплата 50 руб."
+        b = "Капучино теперь 240 ₽. Доплата за овсяное молоко 50 ₽."
+        self.assertEqual(cf.compare(a, b)["errors"], [])
+        self.assertEqual(cf.compare("Приехали двое.", "Приехали 2 человека.")["errors"], [])
+
+    def test_time_with_zero_minutes_equals_hour(self):
+        self.assertEqual(cf.compare("Ждём с 11 до 16.", "Ждём с 11:00 до 16:00.")["errors"], [])
+
+    def test_unit_change_is_an_error(self):
+        self.assertIn("unit", kinds(cf.compare("Держит тепло 6 часов.", "Держит тепло 6 минут.")))
+
+    def test_inverted_negation(self):
+        r = cf.compare("Сервис не сохраняет исходный текст.", "Сервис сохраняет исходный текст.")
+        self.assertIn("inverted", kinds(r))
+
+    def test_negation_moved_inside_sentence_is_fine(self):
+        a = "Довольны не все. Переводы на карту не принимаем."
+        b = "Не все довольны. Переводы на карту мы не принимаем."
+        self.assertEqual(cf.compare(a, b)["errors"], [])
+
+    def test_lost_name(self):
+        r = cf.compare("Согласует Марина Ковалёва из отдела кадров.", "Согласует отдел кадров.")
+        self.assertIn("lost", kinds(r))
+
+    def test_name_in_other_case_is_kept(self):
+        r = cf.compare("Письмо для Олега Петровича.", "Олег Петрович, добрый день.")
+        self.assertEqual(r["errors"], [])
+
+    def test_utm_tail_removal_is_not_a_lost_link(self):
+        a = "Сайт: https://example.ru/help?utm_source=chatgpt.com"
+        b = "Сайт: https://example.ru/help"
+        self.assertEqual(cf.compare(a, b)["errors"], [])
+
+    def test_lost_link(self):
+        self.assertIn("lost", kinds(cf.compare("Подробнее: https://example.ru/a", "Подробнее на сайте.")))
+
+    def test_dates(self):
+        self.assertIn("lost", kinds(cf.compare("Сдача 14 ноября.", "Сдача 28 ноября.")))
+        self.assertEqual(cf.compare("Ярмарка 22–23 ноября.", "Ярмарка пройдёт 22 и 23 ноября.")["errors"], [])
+
+    def test_hedge_loss_is_a_check(self):
+        r = cf.compare("Процедура длится около 60 минут.", "Процедура длится 60 минут.")
+        self.assertEqual(r["errors"], [])
+        self.assertTrue(any(c["kind"] == "hedge" for c in r["checks"]))
+
+    def test_hedge_said_another_way_is_not_lost(self):
+        # 4.1.6: «около» → «примерно», «не менее» → «минимум», «свыше» → «более» keep the hedge.
+        for a, b in (("Пришло около 40 человек.", "Пришло примерно 40 человек."),
+                     ("Срок не менее 5 дней.", "Срок минимум 5 дней."),
+                     ("Вес не более 3 кг.", "Вес максимум 3 кг."),
+                     ("Заказов свыше 200.", "Заказов более 200.")):
+            r = cf.compare(a, b)
+            self.assertEqual([c for c in r["checks"] if c["kind"] == "hedge"], [], (a, b))
+        # another meaning of the hedge is still a check: «не менее 5» → «не более 5»
+        r = cf.compare("Срок не менее 5 дней.", "Срок не более 5 дней.")
+        self.assertTrue(any(c["kind"] == "hedge" for c in r["checks"]))
+
+    def test_swapped_amounts_in_one_sentence(self):
+        # 4.1.6: the example of SKILL.md. A list in one sentence binds each number to the name
+        # of its own clause; before it the sentence had two names and bound nothing.
+        a = "Анна получила 30 000, Борис 50 000."
+        for b in ("Анна получила 50 000, Борис 30 000.",
+                  "Борис получил 30 000, Анна — 50 000.",
+                  "Анне выделили 50 000, Борису — 30 000."):
+            self.assertIn("swap", kinds(cf.compare(a, b)), b)
+        a = "Анна Иванова получила 30 000 рублей, Борис Петров — 50 000 рублей."
+        self.assertIn("swap", kinds(cf.compare(a, "Иванова получила 50 000 рублей, Петров — 30 000 рублей.")))
+        a = "В Москве 12 офисов, в Казани 3 офиса."
+        self.assertIn("swap", kinds(cf.compare(a, "В Москве 3 офиса, в Казани 12 офисов.")))
+
+    def test_same_bindings_in_another_order_are_not_a_swap(self):
+        a = "Анна получила 30 000, Борис 50 000."
+        for b in ("Борис получил 50 000 рублей, Анна — 30 000.",
+                  "Анна получила 30 000 рублей. Борис — 50 000.",
+                  "Получили: Борис — 50 000, Анна — 30 000."):
+            self.assertEqual(cf.compare(a, b)["errors"], [], b)
+        # the same sum for both is bound to both
+        same = "Анна получила 30 000, Борис тоже 30 000."
+        self.assertEqual(cf.compare(same, "Борис получил 30 000, Анна тоже 30 000.")["errors"], [])
+        # a clause with no name or with two names binds nothing
+        a = "Анна, которая работает в Казани, получила 30 000, а Борис 50 000."
+        self.assertEqual(cf.compare(a, "Борис получил 50 000, а Анна, которая работает в Казани, — 30 000.")["errors"], [])
+        self.assertEqual(cf.compare("Анна и Борис получили по 30 000, Вера 50 000.",
+                                    "Вера получила 50 000, а Анна и Борис по 30 000.")["errors"], [])
+        # a row of names with one number is not a list of bindings: «по 100» is not Вера's alone
+        a = "Анна получила 30 000. Вера получила 7. Анна, Борис, Вера — все получили по 100."
+        b = "Анна получила 30 000. Вера получила 7. Все получили по 100: Анна, Борис, Вера."
+        self.assertEqual(cf.compare(a, b)["errors"], [])
+
+    def test_generated_enumerations(self):
+        # «Name amount» lists in one sentence, written in nine shapes: the same bindings in another
+        # order or shape are no error, two amounts exchanged are one. Lists that join the last two
+        # items with «и» are not generated: their items share a clause and the script does not
+        # tell them apart yet (CHANGELOG 4.1.6). A lead-in names everyone in mid-sentence, because
+        # the script reads a capitalised word at the start of a sentence as a name only if it
+        # knows it from elsewhere.
+        people = [("Анна", "Анне", True), ("Борис", "Борису", False), ("Вера", "Вере", True),
+                  ("Глеб", "Глебу", False), ("Дарья", "Дарье", True), ("Егор", "Егору", False),
+                  ("Жанна", "Жанне", True), ("Захар", "Захару", False)]
+        amounts = ["30 000", "50 000", "7 000", "12 500", "450", "1 200", "95", "2 400", "18 000", "640"]
+
+        def verb(p):
+            return "получила" if p[2] else "получил"
+
+        def got(p):
+            return "%s %s" % (p[0], verb(p))
+
+        def first_verb_only(ps):
+            return ", ".join(("%s %s рублей" % (got(p), x)) if i == 0 else ("%s %s рублей" % (p[0], x))
+                             for i, (p, x) in enumerate(ps)) + "."
+
+        def join_and(items):
+            return items[0] if len(items) == 1 else ", ".join(items[:-1]) + " и " + items[-1]
+
+        shapes = {
+            "elided verb": first_verb_only,
+            "verb each": lambda ps: ", ".join("%s %s рублей" % (got(p), x) for p, x in ps) + ".",
+            "dash": lambda ps: ", ".join("%s — %s рублей" % (p[0], x) for p, x in ps) + ".",
+            "semicolon": lambda ps: "; ".join("%s — %s рублей" % (p[0], x) for p, x in ps) + ".",
+            "dative": lambda ps: ", ".join(("%s выплатили %s рублей" % (p[1], x)) if i == 0 else
+                                           ("%s %s рублей" % (p[1], x)) for i, (p, x) in enumerate(ps)) + ".",
+            "number first": lambda ps: ", ".join("%s рублей %s %s" % (x, verb(p), p[0]) for p, x in ps) + ".",
+            "sentences": lambda ps: " ".join("%s %s рублей." % (got(p), x) for p, x in ps),
+            "bullets": lambda ps: "Итоги:\n" + "\n".join("- %s: %s рублей" % (p[0], x) for p, x in ps),
+            "parentheses": lambda ps: ", ".join("%s (%s рублей)" % (p[0], x) for p, x in ps) + ".",
+            "and elided": lambda ps: join_and([("%s %s рублей" % (got(p), x)) if i == 0 else ("%s %s рублей" % (p[0], x))
+                                               for i, (p, x) in enumerate(ps)]) + ".",
+            "and verb each": lambda ps: join_and(["%s %s рублей" % (got(p), x) for p, x in ps]) + ".",
+            "and dash": lambda ps: join_and(["%s — %s рублей" % (p[0], x) for p, x in ps]) + ".",
+            "and number first": lambda ps: join_and(["%s рублей %s %s" % (x, verb(p), p[0]) for p, x in ps]) + ".",
+        }
+        rng = random.Random(4106)
+        for _ in range(300):
+            k = rng.choice((2, 3, 4))
+            pairs = list(zip(rng.sample(people, k), rng.sample(amounts, k)))
+            lead = "Выплаты за октябрь по сотрудникам %s.\n" % ", ".join(p[0] for p, _ in pairs)
+            from_shape, to_shape = rng.choice(sorted(shapes)), rng.choice(sorted(shapes))
+            before = lead + shapes[from_shape](pairs)
+            moved = pairs[:]
+            rng.shuffle(moved)
+            after = lead + shapes[to_shape](moved)
+            self.assertEqual(cf.compare(before, after)["errors"], [], "%s -> %s\n%s\n%s" % (from_shape, to_shape, before, after))
+            i, j = rng.sample(range(k), 2)
+            wrong = pairs[:]
+            wrong[i], wrong[j] = (pairs[i][0], pairs[j][1]), (pairs[j][0], pairs[i][1])
+            rng.shuffle(wrong)
+            after = lead + shapes[to_shape](wrong)
+            self.assertIn("swap", kinds(cf.compare(before, after)), "%s -> %s\n%s\n%s" % (from_shape, to_shape, before, after))
+
+    def test_one_hedge_left_does_not_cover_two_lost(self):
+        # «около 40 … примерно 40» → «40 … примерно 40»: the first hedge is gone, and the synonym
+        # that is left belongs to the second number.
+        a = "Первый этап длится около 40 минут, второй — примерно 40 минут."
+        hedge = lambda r: [c for c in r["checks"] if c["kind"] == "hedge"]
+        self.assertEqual(len(hedge(cf.compare(a, "Первый этап длится 40 минут, второй — примерно 40 минут."))), 1)
+        # each said another way: nothing is lost
+        self.assertEqual(hedge(cf.compare(a, "Первый этап длится примерно 40 минут, второй — приблизительно 40 минут.")), [])
+        # two mentions that became one are the «fewer» check, not also a lost hedge
+        merged = cf.compare("Первый этап длится около 40 минут, второй тоже около 40 минут.",
+                            "Каждый этап длится около 40 минут.")
+        self.assertEqual(hedge(merged), [])
+
+    def test_hedges_are_counted_mention_by_mention(self):
+        # Three hedged mentions of 40 need three hedges of that meaning in the edit, also when one
+        # of the words is repeated: «около 40 … примерно 40 … около 40» → «40 … примерно 40 … примерно 40».
+        hedge = lambda r: [c for c in r["checks"] if c["kind"] == "hedge"]
+        a = "Первый этап длится около 40 минут, второй примерно 40 минут, третий около 40 минут."
+        lost = hedge(cf.compare(a, "Первый этап длится 40 минут, второй примерно 40 минут, третий примерно 40 минут."))
+        self.assertEqual(len(lost), 1)
+        self.assertIn("«около»", lost[0]["detail"])
+        self.assertEqual(hedge(cf.compare(
+            a, "Первый этап длится примерно 40 минут, второй приблизительно 40 минут, третий порядка 40 минут.")), [])
+        # the same word lost at one of its two mentions
+        b = "Первый этап длится около 40 минут, второй тоже около 40 минут."
+        self.assertEqual(len(hedge(cf.compare(b, "Первый этап длится 40 минут, второй тоже около 40 минут."))), 1)
+        # «не менее чем 6» is a hedge that says «минимум»; «не старше 14 дней» says «не более 14 дней»
+        self.assertEqual(hedge(cf.compare("Нужно минимум 6 часов.", "Нужно не менее чем 6 часов.")), [])
+        self.assertEqual(len(hedge(cf.compare("Нужно не менее чем 6 часов.", "Нужно 6 часов."))), 1)
+        self.assertEqual(hedge(cf.compare("Результат действителен не более 14 дней.", "Результат не старше 14 дней.")), [])
+
+    def test_marks_moved_between_a_hedge_and_its_number_do_not_lose_it(self):
+        # In the edit, bold and italic marks between the hedge and the number do not hide the hedge
+        # (d08 of the corpus: «**минимум 2 человека**» → «минимум **2 человека**»). A hedge that is
+        # really gone, changed, or cut off from the number by a comma is still a check.
+        hedge = lambda r: [c for c in r["checks"] if c["kind"] == "hedge"]
+        a = "Запрошены ревьюеры: **минимум 2 человека**, один из другой команды.\n"
+        for edit in ("Запрошены ревьюеры: минимум **2 человека**, один из другой команды.\n",
+                     "Запрошены ревьюеры: **минимум** 2 человека, один из другой команды.\n",
+                     "Запрошены ревьюеры: минимум *2 человека*, один из другой команды.\n"):
+            self.assertEqual(hedge(cf.compare(a, edit)), [], edit)
+        for edit in ("Запрошены ревьюеры: **2 человека**, один из другой команды.\n",
+                     "Запрошены ревьюеры: максимум **2 человека**, один из другой команды.\n",
+                     "Запрошены ревьюеры: минимум, **2 человека**, один из другой команды.\n"):
+            self.assertEqual(len(hedge(cf.compare(a, edit))), 1, edit)
+
+    def test_two_people_who_share_a_word_are_two_owners(self):
+        # «Анна Иванова» and «Анна Петрова» have a first name and nothing else in common: a mention
+        # by the surname is one of them, and the amounts of the two can be exchanged.
+        a = "В отделе Анна Иванова и Анна Петрова. Иванова получила 30 рублей. Петрова получила 50 рублей."
+        intro = "В отделе Анна Иванова и Анна Петрова. "
+        self.assertIn("swap", kinds(cf.compare(a, intro + "Иванова получила 50 рублей. Петрова получила 30 рублей.")))
+        self.assertEqual(cf.compare(a, intro + "Петрова получила 50 рублей. Иванова получила 30 рублей.")["errors"], [])
+        # in one sentence, and with the surname shared instead of the first name
+        b = "Анна Иванова получила 30 рублей, Анна Петрова — 50 рублей."
+        self.assertIn("swap", kinds(cf.compare(b, "Анна Иванова получила 50 рублей, Анна Петрова — 30 рублей.")))
+        c = "Анна Иванова получила 30 рублей, Борис Иванов — 50 рублей."
+        self.assertIn("swap", kinds(cf.compare(c, "Анна Иванова получила 50 рублей, Борис Иванов — 30 рублей.")))
+        # a word that fits both of them names nobody: no owner, no swap (the lost surnames are another error)
+        self.assertNotIn("swap", kinds(cf.compare(b, "Анна получила 30 рублей, Анна — 50 рублей.")))
+        # Анна Петрова shares a word with each of the others, so only «Борис» and «Иванова» tell people apart
+        d = "В отделе Анна Иванова, Анна Петрова и Борис Петров. Анна Иванова получила 30000 рублей, Борис Петров — 50000 рублей."
+        self.assertEqual(cf.compare(d, d.replace("Борис Петров — 50000", "Петров — 50000"))["errors"], [])
+
+    def test_a_sender_named_in_full_is_not_a_receiver(self):
+        # «от Бориса Петрова»: both words name the sender, not only the first
+        a = "Анна получила 30 000 от Бориса Петрова, Борис Петров — 50 000."
+        self.assertIn("swap", kinds(cf.compare(a, "Анна получила 50 000 от Бориса Петрова, Борис Петров — 30 000.")))
+        b = "Анна получила 30 рублей, Борис — 50 рублей; Анна получила 70 рублей, которые перечислил Борис Петров, как и договаривались."
+        c = "Анна получила 30 рублей, Борис — 50 рублей; Анна получила, как и договаривались, от Бориса Петрова 70 рублей."
+        self.assertEqual(cf.compare(b, c)["errors"], [])
+        # with a patronymic, and the case forms of one person («Анна Иванова», «от Анны Ивановой») are one person
+        d = "Анна получила 30 000 от Бориса Андреевича Петрова, Борис Петров — 50 000."
+        self.assertIn("swap", kinds(cf.compare(d, "Анна получила 50 000 от Бориса Андреевича Петрова, Борис Петров — 30 000.")))
+        e = "Выплаты: Анна Иванова, Борис Петров. Анна Иванова получила 30000 рублей, Борис Петров получил 50000 рублей от Анны Ивановой."
+        self.assertIn("swap", kinds(cf.compare(e, e.replace("Анна Иванова получила 30000", "Иванова получила 50000")
+                                               .replace("получил 50000", "получил 30000"))))
+
+    def test_generated_senders_and_shared_names(self):
+        # Items with a sender after «от» or in a clause of their own, receivers named in full or by
+        # the surname, people who share a first name or a surname: the same facts told another way
+        # are no error, two amounts exchanged are one.
+        people = {"anna": ("Анна Иванова", "Анны Ивановой", "а"), "boris": ("Борис Петров", "Бориса Петрова", ""),
+                  "vera": ("Вера Орлова", "Веры Орловой", "а"), "gleb": ("Глеб Волков", "Глеба Волкова", ""),
+                  "boris3": ("Борис Андреевич Петров", "Бориса Андреевича Петрова", "")}
+
+        def item(shape, receiver, surname_only, amount, sender):
+            name = people[receiver][0].split()[-1] if surname_only else people[receiver][0]
+            got = "получил" + people[receiver][2]
+            return {1: "%s %s %s рублей от %s" % (name, got, amount, people[sender][1]),
+                    2: "%s %s от %s %s рублей" % (name, got, people[sender][1], amount),
+                    3: "%s — %s рублей от %s" % (name, amount, people[sender][1]),
+                    4: "%s %s %s рублей, которые перечислил %s" % (name, got, amount, people[sender][0])}[shape]
+
+        rng = random.Random(4107)
+        quads = [q for q in itertools.product(people, repeat=4)
+                 if q[0] != q[1] and q[2] != q[3] and q[0] != q[2] and q[1] != q[3]
+                 and not {"boris", "boris3"} <= set(q)]
+        for r1, r2, s1, s2 in rng.sample(quads, 40):
+            lead = "Выплаты: %s. " % ", ".join(people[p][0] for p in dict.fromkeys((r1, r2, s1, s2)))
+            before = lead + "%s, %s." % (item(1, r1, False, "30000", s1), item(1, r2, False, "50000", s2))
+            for (sh1, sh2), surname_only in itertools.product(((2, 2), (3, 4), (4, 1), (1, 3)), (False, True)):
+                for amounts, expect_swap in (("30000 50000", False), ("50000 30000", True)):
+                    x, y = amounts.split()
+                    after = lead + "%s, %s." % (item(sh1, r1, surname_only, x, s1), item(sh2, r2, surname_only, y, s2))
+                    got = kinds(cf.compare(before, after))
+                    self.assertEqual("swap" in got, expect_swap, "\n%s\n%s" % (before, after))
+
+    def test_a_sender_is_not_the_one_who_gets_the_amount(self):
+        a = "Анна получила 30 рублей, Борис — 50 рублей; Анна получила, как и договаривались, от Бориса 70 рублей."
+        b = "Анна получила 30 рублей, Борис — 50 рублей; Анна получила 70 рублей, которые перечислил Борис, как и договаривались."
+        self.assertEqual(cf.compare(a, b)["errors"], [])
+        # the amounts of the items still count
+        self.assertIn("swap", kinds(cf.compare(a, a.replace("30 рублей", "50 рублей", 1).replace("— 50 рублей", "— 30 рублей", 1))))
+        # a list where each item says who sent the money: the receiver is the first name of an item
+        c = "Анна получила 30 000 от Глеба, Вера — 7 000 от Дарьи."
+        self.assertEqual(cf.compare(c, "Вера получила 7 000 от Дарьи, Анна — 30 000 от Глеба.")["errors"], [])
+        self.assertIn("swap", kinds(cf.compare(c, "Анна получила 7 000 от Дарьи, Вера — 30 000 от Глеба.")))
+
+    def test_a_person_named_by_first_name_surname_or_both_is_one_owner(self):
+        a = "В отделе Анна Иванова и Борис Петров. Анна получила 30 000, Борис — 50 000."
+        # the same bindings, one person named by the surname: no error
+        self.assertEqual(cf.compare(a, "В отделе Анна Иванова и Борис Петров. Иванова получила 30 000, Борис — 50 000.")["errors"], [])
+        # amounts exchanged, both people named by the surname: an error
+        self.assertIn("swap", kinds(cf.compare(a, "В отделе Анна Иванова и Борис Петров. Иванова получила 50 000, Петров — 30 000.")))
+
+    def test_year_of_numeric_date(self):
+        self.assertIn("lost", kinds(cf.compare("Срок — 01.02.2026.", "Срок — 01.02.2027.")))
+        self.assertEqual(cf.compare("Срок — 01.02.2026.", "Срок: 1 февраля 2026.")["errors"], [])
+
+    def test_compound_number_words(self):
+        self.assertEqual(cf.compare("В группе двадцать пять человек.", "В группе 25 человек.")["errors"], [])
+        self.assertEqual(cf.compare("Привезли сто двадцать коробок.", "Привезли 120 коробок.")["errors"], [])
+        self.assertIn("lost", kinds(cf.compare("В группе двадцать пять человек.", "В группе 20 человек.")))
+
+    def test_utm_with_other_params_is_not_a_lost_link(self):
+        a = "Сайт: https://example.org/?utm_source=chatgpt.com&id=42"
+        b = "Сайт: https://example.org/?id=42"
+        self.assertEqual(cf.compare(a, b)["errors"], [])
+        a = "Сайт: https://example.org/?id=42&utm_source=openai"
+        self.assertEqual(cf.compare(a, b)["errors"], [])
+
+    def test_lost_author_utm_tag_is_reported(self):
+        # R-FACTS + R-PASTE: the author's campaign tags are part of the link.
+        a = "Записаться: https://shop.example.ru/sale?utm_source=newsletter&utm_campaign=autumn"
+        b = "Записаться: https://shop.example.ru/sale"
+        self.assertIn("lost", kinds(cf.compare(a, b)))
+
+    def test_modality_shift_is_a_check(self):
+        r = cf.compare("Пользователь может увидеть старые данные. Субботник запланирован на апрель.",
+                       "Пользователь увидит старые данные. Субботник пройдёт в апреле.")
+        details = " ".join(c["detail"] for c in r["checks"] if c["kind"] == "modality")
+        self.assertIn("может", details)
+        self.assertIn("план", details)
+        same = "Иногда кэш отдаёт старые данные."
+        self.assertFalse([c for c in cf.compare(same, same)["checks"] if c["kind"] == "modality"])
+
+    def test_scope_attribution_and_intensifiers_are_checks(self):
+        def details(a, b):
+            return " ".join(c["detail"] for c in cf.compare(a, b)["checks"] if c["kind"] == "modality")
+        self.assertIn("риск", details("Есть риск переделок.", "Работу придётся переделывать."))
+        self.assertIn("один из", details("Это один из лучших курсов.", "Это лучший курс."))
+        self.assertIn("по данным", details("По словам врача, это безопасно.", "Это безопасно."))
+        self.assertIn("главный", details("Температура — ключевой фактор.", "Температура — главный фактор."))
+        self.assertEqual(details("Это самый тёплый месяц.", "Это самый тёплый месяц года."), "")
+
+    def test_lost_html_tags_are_errors(self):
+        before = "<ul>\n<li><strong>Диагностика</strong> бесплатно</li>\n<li>Запчасти клиента</li>\n</ul>"
+        after = "<p>Диагностика бесплатно, запчасти клиента принимаем.</p>"
+        res = cf.compare(before, after)
+        lost = [e["detail"] for e in res["errors"] if e["what"] == "разметка"]
+        self.assertIn("<li> 2 → 0", lost)
+        self.assertNotIn("<strong> 1 → 0", lost)  # emphasis may be removed on purpose: a check
+        self.assertIn("<strong> 1 → 0", [c["detail"] for c in res["checks"] if c["what"] == "разметка"])
+        same = cf.compare(before, before.replace("бесплатно", "бесплатна"))
+        self.assertFalse([e for e in same["errors"] if e["what"] == "разметка"])
+        # Autolinks are not tags; tag names are case-insensitive.
+        links = "Пишите <hr@lapka.ru> или <https://lapka.ru/a>, <https://lapka.ru/b>."
+        self.assertFalse([e for e in cf.compare(links, "Пишите hr@lapka.ru.")["errors"] if e["what"] == "разметка"])
+        upper = cf.compare("<UL><LI>Раз</LI><LI>Два</LI></UL>", "<p>Раз, два</p>")
+        self.assertIn("<li> 2 → 0", [e["detail"] for e in upper["errors"] if e["what"] == "разметка"])
+        # Angle brackets in prose and a single tag are not markup to protect.
+        self.assertFalse([e for e in cf.compare("Тег <b> жирный", "Тег жирный")["errors"] if e["what"] == "разметка"])
+
+    def test_polite_pronoun_and_line_break_are_not_facts(self):
+        self.assertEqual(cf.compare("Поздравляем Вас и желаем Вашего успеха.", "Поздравляем и желаем успеха.")["errors"], [])
+        self.assertEqual(cf.compare("Вариант 3\n\nНоябрь — время книг.", "Ноябрь — время книг.")["errors"], [])
+        self.assertIn("lost", kinds(cf.compare("Сдача 3 ноября.", "Сдача в ноябре.")))
+        self.assertIn("lost", kinds(cf.compare("Офис в Вашингтоне закрыт.", "Офис закрыт.")))
+
+    def test_changed_quote_is_lost(self):
+        # Issue #264: the quoted words changed, the report was empty.
+        r = cf.compare("Сообщение: «готов к запуску».", "Сообщение: «уже запущен».")
+        self.assertIn({"kind": "lost", "what": "цитата", "detail": "«готов к запуску»"}, r["errors"])
+        r = cf.compare("Он ответил: \"Пока не готов\".", "Он ответил: «Готов».")
+        self.assertIn("lost", kinds(r))
+        r = cf.compare("«Мы готовы», — сказал Иван.", "«Мы почти готовы», — сказал Иван.")
+        self.assertIn("lost", kinds(r))
+        r = cf.compare("«Готовы ли вы?» — спросил Иван.", "«Вы готовы?» — спросил Иван.")
+        self.assertIn("lost", kinds(r))
+
+    def test_rephrased_words_in_quotes_inside_a_phrase_are_a_check(self):
+        # Terms, irony and examples inside a phrase: rephrasing them is a check, not an error.
+        for a, b in (("Всегда откладывали «начать с понедельника»?", "Всё откладывали на понедельник?"),
+                     ("Я заменил её на «хочу быть ближе к продукту» — так честнее.", "Я написал, что хочу к продукту.")):
+            r = cf.compare(a, b)
+            self.assertEqual(r["errors"], [], a)
+            self.assertIn(("lost", "цитата"), {(c["kind"], c["what"]) for c in r["checks"]}, a)
+
+    def test_quote_marks_and_case_endings_may_change(self):
+        # "…" → «…» is the skill's own typography; a quoted name may take another case.
+        self.assertEqual(cf.compare("Он сказал: \"Запуск в среду\".", "Он сказал: «Запуск в среду».")["errors"], [])
+        r = cf.compare("Кофейня «Зерно» открылась.", "Открыли кофейню «Зерна» на углу.")
+        self.assertEqual([e for e in r["errors"] if e["what"] == "цитата"], [])
+        r = cf.compare("Договор с ООО \"Ромашка\" продлён.", "Договор с ООО «Ромашка» продлили.")
+        self.assertEqual(r["errors"], [])
+
+    def test_unquoted_and_added_quotes_are_checks(self):
+        r = cf.compare("Это так называемый «умный дом».", "Это умный дом.")
+        self.assertEqual(r["errors"], [])
+        self.assertIn("unquoted", {c["kind"] for c in r["checks"]})
+        r = cf.compare("Директор одобрил план.", "Директор сказал: «План хороший».")
+        self.assertIn(("added", "цитата"), {(c["kind"], c["what"]) for c in r["checks"]})
+
+    def test_inch_marks_are_not_quotes(self):
+        r = cf.compare("Монитор 27\" и ноутбук 15\" в наличии.", "В наличии монитор 27\" и ноутбук 15\".")
+        self.assertEqual(r["counts"]["quote"], 0)
+        self.assertEqual(r["errors"], [])
+
+    def test_source_from_stdin_is_read_as_utf8_whatever_the_console(self):
+        # 4.2.0: on Windows sys.stdin decodes with the console code page (cp1251); two identical
+        # UTF-8 texts with the source piped in gave four false errors. cp1251 imitates that console.
+        import os
+        with tempfile.TemporaryDirectory() as tmp_dir:
+            tmp = Path(tmp_dir)
+            text = "Анна получила 30 000 рублей 12 марта по словам бухгалтера."
+            (tmp / "same.txt").write_text(text, encoding="utf-8")
+            env = dict(os.environ, PYTHONIOENCODING="cp1251")
+            env.pop("PYTHONUTF8", None)
+            res = subprocess.run([sys.executable, str(SCRIPTS / "check_facts.py"), "-", str(tmp / "same.txt")],
+                                 input=text.encode("utf-8"), capture_output=True, env=env)
+            self.assertEqual(res.returncode, 0, res.stdout.decode("cp1251", "replace"))
+
+    def test_cli_exit_codes(self):
+        with tempfile.TemporaryDirectory() as tmp_dir:
+            tmp = Path(tmp_dir)
+            (tmp / "a.txt").write_text("Цена 240 рублей.", encoding="utf-8")
+            (tmp / "b.txt").write_text("Цена 260 рублей.", encoding="utf-8")
+            run = lambda x, y: subprocess.run([sys.executable, str(SCRIPTS / "check_facts.py"), str(x), str(y)],
+                                              capture_output=True).returncode
+            self.assertEqual(run(tmp / "a.txt", tmp / "a.txt"), 0)
+            self.assertEqual(run(tmp / "a.txt", tmp / "b.txt"), 1)
+            self.assertEqual(run(tmp / "a.txt", tmp / "nope.txt"), 2)
+            (tmp / "q1.txt").write_text("Сообщение: «готов к запуску».", encoding="utf-8")
+            (tmp / "q2.txt").write_text("Сообщение: «уже запущен».", encoding="utf-8")
+            self.assertEqual(run(tmp / "q1.txt", tmp / "q2.txt"), 1)
+
+
+    def test_list_markers_are_structure_not_facts(self):
+        # 4.2.0: examples.md #4 turns prose into steps; the markers were read as added numbers
+        # (98 such errors over 1596 old eval edits).
+        prose = ("Проверьте, что с покупки прошло не более 14 дней. Сохраните чек. "
+                 "Товары со скидкой более 50% возврату не подлежат.")
+        steps = ("1. Проверьте, что с покупки прошло не больше 14 дней.\n2) Сохраните чек.\n\n"
+                 "Товары со скидкой больше 50% вернуть нельзя.")
+        self.assertEqual(cf.compare(prose, steps)["errors"], [])
+        self.assertEqual(cf.compare(steps, prose)["errors"], [])
+        for marker in ("## 3. Раздел\n\nТекст.", "> 4. Пункт.", "- 5. Пункт.", "   6) Пункт.",
+                       "**7. Пункт**", "**8.** Пункт.", "9. Пункт.", "\ufeff1. Пункт."):
+            self.assertEqual(cf.compare(marker, "Текст без номера.")["errors"], [], marker)
+        # A number inside an item is still a fact, and a number that is not a marker too.
+        self.assertIn("lost", kinds(cf.compare("1. Возьмите 3 пакета.", "1. Возьмите пакеты.")))
+        self.assertIn("lost", kinds(cf.compare("Осталось 3. Потом ещё.", "Осталось немного. Потом ещё.")))
+        self.assertIn("lost", kinds(cf.compare("Мест:\n120. Это много.", "Мест много.")))
+
+    # 4.1.4: defects found by a property run over the eval texts and by two model bug hunts.
+    def errs(self, a, b):
+        return {(e["kind"], e["what"]) for e in cf.compare(a, b)["errors"]}
+
+    def test_versions_weekdays_and_inline_code_are_facts(self):
+        self.assertIn(("lost", "число"), self.errs("Версия 2.1.3 вышла.", "Версия 2.1.4 вышла."))
+        self.assertIn(("lost", "дата"), self.errs("Встреча в среду.", "Встреча в четверг."))
+        self.assertEqual(self.errs("Рабочая среда готова.", "Окружение готово."), set())
+        # Frontier arm 09.11 (f30): «пн–пт» spelled out as «с понедельника по пятницу» was two added dates.
+        self.assertEqual(self.errs("Работаем пн–пт с 9:00.", "Работаем с понедельника по пятницу с 9:00."), set())
+        self.assertEqual(self.errs("Сб-Вс: выходной.", "В субботу и воскресенье выходной."), set())
+        self.assertIn(("lost", "дата"), self.errs("Работаем пн–пт.", "Работаем с понедельника по четверг."))
+        self.assertEqual(self.errs("Ср. выше.", "Сравните выше."), set())  # «ср.» alone is «сравни»
+        # M3 09.11 (f01 ours): «15 или 16 ноября» read 15 as a new number.
+        self.assertEqual(self.errs("Завтрак только 14, 15 и 16 ноября.", "Приходите 14, 15 или 16 ноября."), set())
+        self.assertIn(("lost", "дата"), self.errs("Приходите 15 или 16 ноября.", "Приходите 16 ноября."))
+        # check_scripts --against main 10.11 (final2 chukovsky n20): «в 2 раза дешевле» → «вдвое дешевле»
+        # was a lost 2 once list numbers stopped hiding it.
+        self.assertEqual(self.errs("Парафин в 2 раза дешевле.", "Парафин вдвое дешевле."), set())
+        self.assertEqual(self.errs("Цена выросла втрое.", "Цена выросла в три раза."), set())
+        self.assertIn(("lost", "число"), self.errs("Гостей вдвое больше.", "Гостей больше."))
+        self.assertIn(("lost", "код"), self.errs("Код: `npm run build`", "Код: `npm run dev`"))
+        r = cf.compare("Запуск: `make`", "Запуск: make")
+        self.assertEqual(r["errors"], [])
+        self.assertIn(("unquoted", "код"), {(c["kind"], c["what"]) for c in r["checks"]})
+
+    def test_phones_and_links_compare_by_meaning(self):
+        self.assertEqual(self.errs("Звоните: +7 (999) 123-45-67.", "Телефон 8 999 123 45 67."), set())
+        self.assertIn(("lost", "телефон"), self.errs("Звоните: +7 999 123-45-67.", "Звоните: +7 999 123-45-68."))
+        self.assertEqual(self.errs("Сайт: https://zerno.ru/", "Сайт https://Zerno.ru"), set())
+        self.assertIn(("lost", "ссылка"), self.errs("https://example.ru/A", "https://example.ru/a"))
+        self.assertEqual(cf.compare("Хост https://[::1]/ доступен.", "Хост https://[::1]/ доступен.")["errors"], [])
+
+    def test_numbers_keep_precision_units_and_ranges(self):
+        self.assertIn(("lost", "число"), self.errs("Цена 100000,01 ₽.", "Цена 100000,02 ₽."))
+        self.assertIn(("unit", "единица"), self.errs("Пришло 30 тыс. человек.", "Пришло 30 тыс. рублей."))
+        self.assertIn(("unit", "единица"), self.errs("Цена пять рублей.", "Цена пять долларов."))
+        for a, b in (("Цена 1,50 ₽.", "Цена 1.50 ₽."), ("С 2020 г. работаем.", "С 2020 года работаем."),
+                     ("Встреча в 16:00.", "Встреча в 16 часов."), ("С 5 по 7 марта.", "5–7 марта."),
+                     ("В группе двадцать один человек.", "В группе 21 человек."),
+                     ("Подожди одну минуту.", "Подожди 1 минуту.")):
+            self.assertEqual(self.errs(a, b), set(), a)
+        r = cf.compare("Держит тепло 6 часов.", "Держит тепло 6.")
+        self.assertIn(("unit", "единица"), {(c["kind"], c["what"]) for c in r["checks"]})
+
+    def test_month_without_day_is_a_date(self):
+        self.assertIn(("lost", "дата"), self.errs("Встреча в марте 2026.", "Встреча в апреле 2026."))
+        self.assertEqual(self.errs("Сдача в марте.", "Сдать нужно в марте."), set())
+
+    def test_negations_with_prepositions_and_added_ones(self):
+        self.assertIn(("inverted", "отрицание"), self.errs("Оплата не на карту.", "Оплата на карту."))
+        self.assertIn(("inverted", "отрицание"), self.errs("Здесь нельзя курить.", "Здесь можно курить."))
+        r = cf.compare("Мы храним данные.", "Мы не храним данные.")
+        self.assertIn(("inverted", "отрицание"), {(c["kind"], c["what"]) for c in r["checks"]})
+        # "не X, а Y" is the pattern a rewrite removes: the contrast is a check, not an error.
+        r = cf.compare("Переезд в марте, а не в феврале.", "Переезд в марте, хотя планировали в феврале.")
+        self.assertEqual(r["errors"], [])
+        self.assertEqual(self.errs("Никаких дрожжей и сахара.", "Ни дрожжей, ни сахара."), set())
+
+    def test_full_names_still_bind_numbers(self):
+        a = "Анна Иванова получила 30 рублей. Борис Петров получил 50 рублей."
+        b = "Анна Иванова получила 50 рублей. Борис Петров получил 30 рублей."
+        self.assertIn(("swap", "привязка"), self.errs(a, b))
+
+    def test_short_names_and_cyrillic_acronyms(self):
+        self.assertEqual(self.errs("Письмо для Ани.", "Написал Ане."), set())
+        self.assertIn(("lost", "имя или название"), self.errs("Компания из США открыла офис.", "Компания открыла офис."))
+        self.assertEqual(self.errs("Павел пришёл, ждём Павла.", "Ждём Павла."), set())
+        self.assertEqual(self.errs("Отдайте заявление в УК дома.", "Отдайте заявление в управляющую компанию."), set())
+
+    def test_direct_speech_is_word_for_word(self):
+        self.assertIn(("lost", "цитата"), self.errs("Он сказал: «Мы запустили проект».", "Он сказал: «Мы запустим проект»."))
+
+    def test_report_agrees_in_gender(self):
+        text = cf.render(cf.compare("Звоните: +7 999 123-45-67.", "Звоните нам."))
+        self.assertIn("потерян телефон", text)
+
+    def test_receipt_line_is_the_scripts_own(self):
+        # R-RECEIPT, M4 2026-11-09: agents retold the report and gave other numbers in 3 of 9 lines, so
+        # the script writes the notes line itself; it never says «на месте» while an error is left.
+        src = "Анна, скидка 20% до 30 ноября, звоните +7 999 123-45-67."
+        self.assertEqual(cf.receipt(cf.compare(src, src)),
+                         "Сверка скриптом: 1 число, 1 дата, 1 имя или название, 1 телефон на месте.")
+        lost = cf.compare(src, "Анна, скидка до 30 ноября, звоните +7 999 123-45-67.")
+        self.assertEqual(cf.receipt(lost), "Сверка скриптом: в исходнике 1 число, 1 дата, 1 имя или название, "
+                                           "1 телефон; в правке нет: 20%.")
+        added = cf.compare(src, src.replace("20%", "25%"))
+        self.assertEqual(cf.receipt(added), "")
+        self.assertIn("Строки для заметок нет", cf.receipt_hint(added))
+        self.assertIn("Строка для заметок: Сверка скриптом:", cf.receipt_hint(cf.compare(src, src)))
+        self.assertEqual(cf.receipt(cf.compare("Хорошо.", "Хорошо.")), "Сверка скриптом: чисел, дат и имён в тексте нет.")
+        forms = ("число", "числа", "чисел")
+        self.assertEqual([cf.plural(n, forms) for n in (1, 2, 5, 11, 12, 14, 21, 22, 25, 101, 111, 112)],
+                         ["число", "числа", "чисел", "чисел", "чисел", "чисел", "число", "числа", "чисел",
+                          "число", "чисел", "чисел"])
+        for text in ("Анна, 5 мая.", "Числа 1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 13, 14, 15, 16, 17, 18, 19, 20, 21."):
+            self.assertTrue(cf.receipt(cf.compare(text, text)).endswith("на месте."), text)
+
+    # 4.1.5: findings of the cross-review of 4.1.4 (GPT-6.1 Sol, Gemini 4 Argon), each rerun first.
+    def test_ip_addresses_and_versions_are_whole_tokens(self):
+        self.assertIn(("lost", "число"), self.errs("Адрес 10.0.10.1.", "Адрес 10.0.10.2."))
+        r = cf.compare("Версия 2.1.10 вышла.", "Версия 2.1.11 вышла.")
+        self.assertIn("2.1.10", {e["detail"] for e in r["errors"]})
+        self.assertEqual(self.errs("Срок 01.02.26.", "Срок 1 февраля 2026."), set())
+
+    def test_link_path_keeps_its_trailing_slash(self):
+        self.assertIn(("lost", "ссылка"), self.errs("См. https://a.ru/api/item/", "См. https://a.ru/api/item"))
+
+    def test_month_needs_a_month_ending(self):
+        self.assertNotIn(("lost", "дата"), self.errs("Позвали Марту.", "Позвали Анну."))
+        self.assertEqual(self.errs("Восстание декабристов.", "Восстание дворян."), set())
+        self.assertIn(("lost", "дата"), self.errs("Между маем и июнем.", "В июне."))
+
+    def test_ban_said_another_way_is_only_a_check(self):
+        # 25 fresh rewrites (DeepSeek texts, Haiku edits): the ban stayed as «не готовим».
+        r = cf.compare("Суп нельзя приготовить без сливок, альтернатива — кокосовое молоко.",
+                       "Без сливок суп не готовим. Вместо них можно взять кокосовое молоко.")
+        self.assertEqual(r["errors"], [])
+        self.assertIn(("inverted", "отрицание"), {(c["kind"], c["what"]) for c in r["checks"]})
+
+    def test_long_interview_answer_is_direct_speech(self):
+        # The same fresh set: an interview answer of 110 characters was rewritten and went unseen.
+        a = ("Интервью.\n\n— «Мы ожидали окупаемость 18 месяцев, а получили 14. Экономия появилась не сразу,"
+             " а через квартал после запуска».\n")
+        b = ("Интервью.\n\n— «Ждали окупаемость за 18 месяцев, вышло за 14. Экономия появилась не сразу,"
+             " а через квартал после запуска».\n")
+        self.assertIn(("lost", "цитата"), self.errs(a, b))
+
+    def test_surname_alone_still_binds_the_number(self):
+        a = "Анна Иванова получила 30 рублей. Борис Петров получил 50 рублей."
+        b = "Анна и Борис пришли. Иванова получила 50 рублей. Петров получил 30 рублей."
+        self.assertIn(("swap", "привязка"), self.errs(a, b))
+
+    def test_removed_paste_leftovers_are_not_lost_facts(self):
+        # 4.1.7: SKILL.md step 1 removes [cite: N] and invisible characters; the check read the
+        # citation number as a lost number and the soft hyphen as a changed quote.
+        for a, b in (("Тестирование системы [cite: 1] прошло успешно.", "Тестирование системы прошло успешно."),
+                     ("[cite_start]Продажи выросли на 12% [cite: 3].", "Продажи выросли на 12%."),
+                     ("Рост [oaicite:7] на 5%【3†source】.", "Рост на 5%."),
+                     ("Он ответил: «Побе\u00adда!».", "Он ответил: «Победа!»."),
+                     ("В 20\u200b26 году.", "В 2026 году."),
+                     ("Он приехал в Ка\u00adзань.", "Он приехал в Ка\u00adзань."),
+                     ("Он не работает в выходные, но ра\u00adботает в будни.", "В выходные выходной, но он работает в будни."),
+                     ("Подожди од\u00adну минуту.", "Подожди 1 минуту.")):
+            self.assertEqual(cf.compare(a, b)["errors"], [], a)
+        # a real change behind the same leftovers is still seen
+        self.assertIn(("lost", "число"), self.errs("Рост на 12% [cite: 3].", "Рост на 15%."))
+
+    def test_clean_paste_output_passes_the_check(self):
+        # The two scripts agree: what clean_paste.py removes is never a lost fact for check_facts.py.
+        for src in ("Итог :contentReference[oaicite:2]{index=2} — 30 000 ₽ до 15 декабря.",
+                    "См. [Колос](https://ru.wikipedia.org/wiki/Колос_(значения)?utm_source=chatgpt.com) [cite: 4].",
+                    "Ве\u00adбинар в 19:00\u200b, запись https://a.ru/w?utm_source=openai\u2060.",
+                    "[cite_start]Срок — 2 недели, «не позже 1 марта»[cite: 1, 2].",
+                    "См. https://a.ru/x?utm_source=chatgpt.com[cite: 1].",
+                    "См. https://a.ru/x?utm_source=chatgpt.com【1†source】.",
+                    "См. https://a.ru/x?utm_source=chatgpt.com:contentReference[oaicite:1]{index=1}.",
+                    "См. https://a.ru/x?utm_source=chatgpt.com\u200e."):
+            self.assertEqual(cf.compare(src, cp.clean(src)[0])["errors"], [], src)
+
+    def test_dot_decimal_rewritten_with_comma_is_the_same_number(self):
+        # 4.1.7: «1.15» was read as the time 1:15, so «1,15» looked like a new number.
+        for a, b in (("Коэффициент 1.15 для всех.", "Коэффициент 1,15 для всех."),
+                     ("Рост в 2.10 раза.", "Рост в 2,10 раза."),
+                     ("Рост в 2,10 раза.", "Рост в 2.10 раза."),
+                     ("Встреча в 14.30.", "Встреча в 14:30."),
+                     ("Выручка 1.50 млн рублей.", "Выручка 1,50 млн рублей.")):
+            self.assertEqual(cf.compare(a, b)["errors"], [], a)
+        self.assertIn(("lost", "число"), self.errs("Рост в 1.15 раза.", "Рост в 1,16 раза."))
+        self.assertIn(("lost", "число"), self.errs("Встреча в 9.30.", "Встреча в 9:40."))
+        self.assertIn(("lost", "число"), self.errs("Выручка 1.50 млн рублей.", "Выручка 1.50 тыс. долларов."))
+        # Review of 4.1.7 (Gemini): the pairing works on the facts, so a swap between people stays
+        # visible; it pairs mention by mention; and every pairing is a check, never silent.
+        self.assertIn(("swap", "привязка"), self.errs("Анна получила 1.15, а Борис 2.10.",
+                                                       "Анна получила 2,10, а Борис 1,15."))
+        r = cf.compare("Встреча в 1.15. Коэффициент 1.15.", "Встреча в 1:15. Коэффициент 1,15.")
+        self.assertEqual(r["errors"], [])
+        self.assertEqual(len(r["checks"]), 1)
+        self.assertEqual(cf.compare("Анна получила коэффициент 1.15. Борис пришёл в 1.15.",
+                                    "Анна получила коэффициент 1,15. Борис пришёл в 1:15.")["errors"], [])
+        self.assertIn(("swap", "привязка"), self.errs("Анна получила коэффициент 1.15. Борис пришёл в 1.15.",
+                                                       "Анна пришла в 1:15. Борис получил коэффициент 1,15."))
+        hc = cf.compare("Коэффициент около 1.15. Встреча в 1.15.", "Коэффициент около 1,15. Встреча в 1:15.")
+        self.assertEqual([c for c in hc["checks"] if c["kind"] == "hedge"], [])
+        r = cf.compare("Встреча в 1.15.", "Прибыло 1,15 груза.")
+        self.assertIn("не время", " ".join(c["detail"] for c in r["checks"]))
+
+    def test_citation_inside_code_is_code(self):
+        # Review of 4.1.7 (Gemini): clean_paste.py keeps citations inside code, so the check must too.
+        self.assertTrue(cf.compare("В документации написано `[cite: 1]`.", "В документации написано.")["errors"])
+        code = "Пример:\n\n```\nprint('[cite: 2]')\n```\n"
+        self.assertTrue(cf.compare(code, code.replace("[cite: 2]", ""))["errors"] or
+                        cf.compare(code, code.replace("[cite: 2]", ""))["checks"])
+        prose = "```markdown\nПривет, это пост про кофе за 300 рублей [cite: 1].\n```\n"
+        self.assertEqual(cf.compare(prose, cp.clean(prose)[0])["errors"], [])
+        prose_code = "```markdown\nВ документации написано `[cite: 1]` и обычный текст [cite: 2].\n```\n"
+        self.assertEqual(cf.compare(prose_code, "В документации написано `[cite: 1]` и обычный текст.")["errors"], [])
+
+    def test_link_with_parentheses_is_whole(self):
+        a = "Подробнее: https://ru.wikipedia.org/wiki/Колос_(значения)."
+        self.assertEqual(cf.compare(a, a)["errors"], [])
+        r = cf.compare(a, "Подробнее: https://ru.wikipedia.org/wiki/Колос_(растение).")
+        self.assertIn("https://ru.wikipedia.org/wiki/Колос_(значения)", {e["detail"] for e in r["errors"]})
+        # a parenthesis around the link is not part of it
+        self.assertEqual(cf.compare("(см. https://a.ru/x)", "См. https://a.ru/x.")["errors"], [])
+
+    def test_compound_number_adjectives_and_merged_negation(self):
+        # 4.1.7 (found on fresh MiniMax/Sol and final3 outputs + Round 3 review):
+        # «шестилетний» ↔ «шесть лет» ↔ «6-летний», «столетний» ↔ «100 лет», «полуторачасовой» ↔ «полутора часов»,
+        # «трёхсуточный» ↔ «3 суток», and «без больших порций» → «порции небольшими» keeps the negation as «не-».
+        for a, b in (("Имею шестилетний опыт работы.", "Шесть лет работаю по специальности."),
+                     ("Имею шестилетний опыт работы.", "Опыт работы — 6 лет."),
+                     ("Трёхдневный курс, 6-летний стаж.", "Курс на 3 дня, стаж шесть лет."),
+                     ("Трёх-дневный курс.", "Курс на 3 дня."),
+                     ("Столетний дуб, стопроцентный результат, девяностолетний юбилей.",
+                      "Дубу 100 лет, результат 100%, юбилей 90 лет."),
+                     ("Полуторачасовой разговор.", "Разговор длился больше полутора часов."),
+                     ("Трёхсуточный марафон.", "Марафон на 3 суток."),
+                     ("Хлеб в небольшом количестве. Еда без больших порций. Анализ старше 14 дней.",
+                      "Хлеб в небольшом количестве. Порции небольшими. Анализу больше 14 дней.")):
+            self.assertEqual(cf.compare(a, b)["errors"], [], a)
+        self.assertEqual(cf.compare("Еда без больших порций.", "Еда небольшими порциями.")["checks"], [])
+        self.assertIn(("lost", "число"), self.errs("Имею шестилетний опыт работы.", "Имею пятилетний опыт работы."))
+        self.assertIn(("lost", "число"), self.errs("Имею шестилетний опыт работы.", "Имею большой опыт работы."))
+        self.assertIn(("unit", "единица"), self.errs("Марафон на 3 суток.", "Трёхчасовой марафон."))
+        for a, b in (("Хлеб в небольшом количестве. Еда без больших порций.",
+                      "Хлеб в небольшом количестве. Еда с большими порциями."),
+                     ("Еда без больших порций.", "В небольшом зале еда большими порциями."),
+                     ("Прибыль мы не делим.", "Прибыль мы делим в конце недели."),
+                     ("Подошва не скользит на льду.", "Купили несколько пар: подошва скользит на льду."),
+                     ("Переговоры решили не вести.", "Переговоры решили вести у невесты.")):
+            self.assertIn(("inverted", "отрицание"), self.errs(a, b), a)
+        tbl = "| Роль | Фамилия | Выплата |\n| Кассир | Смирнов | 30 000 ₽ |\n| Курьер | Кузнецов | 50 000 ₽ |"
+        self.assertIn(("lost", "имя или название"), self.errs(tbl, "Кассир получил 30 000 ₽, курьер — 50 000 ₽."))
+        self.assertIn(("swap", "привязка"), self.errs(tbl, "Кассир Смирнов получил 50 000 ₽, а курьер Кузнецов — 30 000 ₽."))
+
+    # 4.2.1: review of check_facts by Fable 5.2 (10.11), every case reproduced before the fix.
+    def test_sentence_start_words_are_not_names(self):
+        # «То» matched «Томске» and «Там» matched «Тамара» by a raw prefix; a footnote mark and a
+        # chat citation in place of the period hid the sentence start (M3 09.11: «Его», «Там»).
+        for a, b in (("То, что мы видим в Томске, удивляет.", "Увиденное в Томске удивляет."),
+                     ("Мы открылись на улице Октябрьской, 19! Там 60 мест. Пришла Тамара.",
+                      "Мы открылись на улице Октябрьской, 19, на 60 мест. Пришла Тамара."),
+                     ("Здесь были болота.[1] Там, где они были, теперь парк.", "Здесь были болота, теперь парк."),
+                     ("Здесь были болота.[12] Там, где они были, теперь парк.", "Здесь были болота, теперь парк."),
+                     ("Здесь были болота. (127) Там, где они были, теперь парк.", "Здесь были болота, теперь парк."),
+                     ("Центр открыт в 2019 году. :contentReference[oaicite:1]{index=1} Его площадь — 340 м².",
+                      "Центр открыт в 2019 году, площадь — 340 м².")):
+            self.assertFalse({e for e in self.errs(a, b) if e[1] in ("имя или название", "привязка")}, a)
+        self.assertIn(("lost", "имя или название"), self.errs("Сбер вырос. Акции Сбера подорожали.", "Банк вырос. Акции подорожали."))
+        self.assertIn(("lost", "имя или название"), self.errs("Пришла Тамара.", "Пришла подруга."))
+        # Second round (Sol, F2): a first name with a fleeting vowel («Павел» → «Павлу») is a name.
+        self.assertIn(("lost", "имя или название"), self.errs("Павлу выдали пропуск.", "Выдали пропуск."))
+        self.assertIn(("swap", "привязка"), self.errs("Павлу выплатили 30 000 рублей, Анна получила 50 000 рублей.",
+                                                     "Павлу выплатили 50 000 рублей, Анна получила 30 000 рублей."))
+        # Cross-review 10.11 (Sol, F2): a citation inside a sentence does not make the next name a
+        # sentence start (the first 4.2.1 draft read it as a period and lost «Microsoft»).
+        self.assertIn(("lost", "имя или название"), self.errs("Мы сотрудничаем[cite: 1] Microsoft.", "Мы сотрудничаем."))
+        self.assertIn(("lost", "имя или название"), self.errs("Утром Томск проснулся. Томск ждал снега.", "Утром город проснулся. Он ждал снега."))
+
+    def test_numbers_glued_to_units(self):
+        for a, b in (("Объём 500мл, вес 10кг, цена 990р.", "Объём 300мл, вес 12кг, цена 890р."),
+                     ("Матрас 160х200 см.", "Матрас 140х200 см."),
+                     ("30к подписчиков. Основан в 2019г.", "50к подписчиков. Основан в 2021г.")):
+            self.assertIn(("lost", "число"), self.errs(a, b), a)
+        for a, b in (("Объём 500мл, вес 10кг.", "Объём 500 мл, вес 10 кг."),
+                     ("Основан в 2019г.", "Основан в 2019 году."),
+                     ("30к подписчиков.", "30 тыс. подписчиков."),
+                     ("Матрас 160х200 см.", "Матрас 160 × 200 см.")):
+            self.assertEqual(self.errs(a, b), set(), a)
+        lost = self.errs("Сервис для B2B и 3D-печати, учёт в 1С, тариф Pro2.", "Сервис для бизнеса и печати, учёт в программе.")
+        self.assertNotIn(("lost", "число"), lost)
+        # Cross-review 10.11 (Sol, F4, F5): «м²» glued to the number and a unit after «30к».
+        self.assertEqual(self.errs("Площадь 50м².", "Площадь 50 м²."), set())
+        self.assertIn(("unit", "единица"), self.errs("Площадь 50м².", "Площадь 50 м."))
+        self.assertEqual(self.errs("Зарплата 30к рублей.", "Зарплата 30 тыс. рублей."), set())
+        self.assertIn(("unit", "единица"), self.errs("Зарплата 30к рублей.", "Зарплата 30 тыс. долларов."))
+
+    def test_a_lost_mention_with_its_own_unit_is_an_error(self):
+        # The bag was keyed by the value alone: «5 дней» kept made the dropped «скидка 5%» a «fewer» check.
+        self.assertIn(("lost", "число"), self.errs("Доставка занимает 5 дней. Скидка 5%.", "Доставка занимает 5 дней."))
+        self.assertEqual(self.errs("Доставка 5 дней, скидка 5%.", "Скидка 5%, доставка за 5 дней."), set())
+
+    def test_a_hedge_turned_the_other_way_is_an_error(self):
+        self.assertIn(("inverted", "оговорка"), self.errs("Нужно не менее 5 человек.", "Нужно не более 5 человек."))
+        self.assertIn(("inverted", "оговорка"), self.errs("Скидка до 30%.", "Скидка от 30%."))
+        self.assertIn(("inverted", "оговорка"), self.errs("Оплата после 20 мая.", "Оплата до 20 мая."))
+        self.assertEqual(self.errs("Нужно не менее 5 человек.", "Нужно минимум 5 человек."), set())
+        # Second round (Sol, F3): spaces or bold inside «не менее» are the same hedge.
+        for a, b in (("Нужно не менее 5 человек.", "Нужно не  менее 5 человек."),
+                     ("Нужно не менее 5 человек.", "Нужно не **менее** 5 человек."),
+                     ("Нужно не  менее 5 человек.", "Нужно не менее 5 человек.")):
+            self.assertNotIn(("inverted", "оговорка"), self.errs(a, b), b)
+        self.assertEqual(self.errs("Подайте заявку не позднее 15 марта.", "Заявку подайте не позже 15 марта."), set())
+        checks = cf.compare("Подайте заявку не позднее 15 марта.", "Подайте заявку 15 марта.")["checks"]
+        self.assertIn("hedge", {c["kind"] for c in checks})
+        # check_scripts --against main 10.11 (final3 prompt m03): the source bounds the date both ways
+        # («до 30 ноября» … «После 30 ноября»), the edit kept «до» and said «После этого»: not a flip.
+        both = cf.compare("Скидка до 30 ноября. После 30 ноября цена вырастет.",
+                          "Скидка до 30 ноября. После этого цена вырастет.")
+        self.assertNotIn(("inverted", "оговорка"), {(e["kind"], e["what"]) for e in both["errors"]})
+        self.assertIn("hedge", {c["kind"] for c in both["checks"]})
+
+    def test_instead_of_is_not_a_lost_negation(self):
+        r = cf.compare("Не покупайте новый ноутбук, обновите старый.",
+                       "Вместо того чтобы покупать новый ноутбук, обновите старый.")
+        self.assertEqual(r["errors"], [])
+        self.assertTrue(r["checks"])
+        self.assertIn(("inverted", "отрицание"), self.errs("Не покупайте новый ноутбук.", "Покупайте новый ноутбук."))
+        # Cross-review 10.11 (Sol, F3): only «вместо того чтобы» right before the verb, and only for
+        # that mention; «Вместо писем отправляйте» and a second, plain «Покупайте» are still errors.
+        self.assertIn(("inverted", "отрицание"), self.errs("Не отправляйте деньги.", "Вместо писем отправляйте деньги."))
+        self.assertIn(("inverted", "отрицание"), self.errs(
+            "Не покупайте товар. Не покупайте подписку.",
+            "Вместо того чтобы покупать товар, возьмите его в аренду. Покупайте подписку."))
+
+    def test_long_digit_runs(self):
+        self.assertIn(("lost", "число"), self.errs("Расчётный счёт 40702810500000012345.", "Расчётный счёт 40702810500000012346."))
+        self.assertEqual(self.errs("Счёт 40702810500000012345.", "Счёт: 40702810500000012345."), set())
+        # Cross-review 10.11 (Sol, F6): the same digits in groups are the same account.
+        self.assertEqual(self.errs("Счёт 40702810500000012345.", "Счёт 40 702 810 500 000 012 345."), set())
+        self.assertIn(("lost", "число"), self.errs("Счёт 40702810500000012345.", "Счёт 40 702 810 500 000 012 346."))
+        # Second round (Sol, F4): a scale after a long number still counts.
+        self.assertIn(("lost", "число"), self.errs("Сумма 1000000000000000 тыс. рублей.", "Сумма 1000000000000000 рублей."))
+        self.assertEqual(self.errs("Сумма 1000000000000000 тыс. рублей.", "Сумма 1000000000000000000 рублей."), set())
+        cf.compare("Код " + "9" * 320 + ".", "Код.")  # raised OverflowError
+
+    def test_long_text_is_checked_in_time(self):
+        import time
+        text = "".join("Пункт %d: компания не открыла %d магазинов в Казани и не планирует, Анна не согласна. " % (i, i + 7)
+                       for i in range(1100))
+        t0 = time.time()
+        self.assertEqual(cf.compare(text, text)["errors"], [])
+        self.assertLess(time.time() - t0, 10, len(text))
+
+    def test_chat_wrapper_values_are_reported_apart(self):
+        src = ("Готово. Текст — **≈630 знаков**, в лимит 650 укладывается.\n\n```\nКафе на Ленина откроется 1 марта.\n```\n\n"
+               "- Если хотите, могу переделать текст в формате карточки Ozon.")
+        r = cf.compare(src, "Кафе на Ленина откроется 1 марта.")
+        self.assertEqual(r["errors"], [])
+        self.assertEqual({s["detail"] for s in r["service"]}, {"630", "650", "Ozon"})
+        line = cf.receipt(r)
+        self.assertIn("служебными строками", line)
+        self.assertIn("630", line)
+        self.assertNotIn("в правке нет", line)
+        post = ("Вот готовый вариант поста для Telegram-канала. Он структурирован так, чтобы клиенты сразу увидели главное.\n\n"
+                "Кофейня «Зерно» откроется 5 мая.\n\nЕсли нужно, могу сократить его до 300 символов.")
+        self.assertEqual(cf.compare(post, "Кофейня «Зерно» откроется 5 мая.")["errors"], [])
+        # A real loss stays an error: a text that opens with «Вот», a tail with a phone, a date in the wrapper,
+        # and a wrapper the edit kept.
+        self.assertIn(("lost", "число"), self.errs("Вот уже 15 лет мы печём хлеб.\n\nПриходите на Ленина, 5.",
+                                                   "Приходите на Ленина, 5."))
+        tail = "Кафе открыто до 22:00.\n\nЕсли хотите заказать торт, звоните +7 900 123-45-67."
+        self.assertIn("lost", {e[0] for e in self.errs(tail, "Кафе открыто до 22:00.")})
+        self.assertIn(("lost", "дата"), self.errs("Готово, отправил 3 марта.\n\n---\n\nКафе на Ленина.", "Кафе на Ленина."))
+        self.assertIn(("lost", "число"), self.errs(src, src.replace("650", "")))
+        # Cross-review 10.11 (Sol, F1): the author's own intro, conclusion and option headings are text.
+        body = "\n\nКурьер приедет в течение 5 дней. Стоимость доставки составляет 300 рублей."
+        self.assertIn(("lost", "имя или название"), self.errs("Вариант 1 — доставка в Казань." + body, body.strip()))
+        self.assertIn(("lost", "число"), self.errs("Готовим к запуску 3 магазина.\n\n---\n\nКурьер приедет через 5 дней.",
+                                                   "Курьер приедет через 5 дней."))
+        self.assertIn(("lost", "имя или название"), self.errs("Курьер приедет через 5 дней.\n\n---\n\nСоветы покупателям: забирайте заказы в Москве.",
+                                                             "Курьер приедет через 5 дней."))
+        self.assertIn(("lost", "число"), self.errs("Вот наши новости: открыли 3 магазина.\n\n---\n\nКурьер приедет через 5 дней.",
+                                                   "Курьер приедет через 5 дней."))
+        # Second round (Sol, F1): «Вот письмо от …» without a colon, an option heading and an offer
+        # that is not about the text are the author's; option headings are never service lines.
+        body = "Курьер приедет в течение 5 дней. Стоимость доставки составляет 300 рублей."
+        for a in ("Вот письмо от Microsoft.\n\n" + body, "**Вариант 1 (доставка в Казань)**\n" + body,
+                  body + "\n\nЕсли хотите, могу доставить заказ в Казань."):
+            self.assertIn(("lost", "имя или название"), self.errs(a, body), a)
+        self.assertIn("проверь", cf.render(r))
+
+    # 4.3.0: currency prefixes/codes, source hedge markup, «не свыше», «и»-joined swaps,
+    # leap-style wrappers & weekday abbreviations, ГОСТ citations and mixed-script homoglyphs.
+    def test_currency_prefixes_symbols_and_codes(self):
+        # R-FACTS: «$20» ↔ «20 долларов» / «20 USD» / «20$» is the same currency; «$20» → «20 рублей» is an error.
+        for a, b in (("Подписка стоит $20 в месяц.", "Подписка стоит 20 долларов в месяц."),
+                     ("Подписка стоит $ 20.", "Подписка стоит 20 USD."),
+                     ("Подписка стоит 20$.", "Подписка стоит 20 долл."),
+                     ("Подписка стоит $20.", "Подписка стоит двадцать долларов."),
+                     ("Билет за €50.", "Билет за 50 евро."),
+                     ("Билет за 50€.", "Билет за 50 EUR."),
+                     ("Книга за £30.", "Книга за 30 фунтов стерлингов."),
+                     ("Книга за 30 фунтов.", "Книга за 30 GBP."),
+                     ("Проезд ¥100.", "Проезд 100 иен."),
+                     ("Проезд ¥100.", "Проезд 100 юаней."),
+                     ("Проезд 100 JPY.", "Проезд ¥100."),
+                     ("Тариф 250 ₽.", "Тариф 250 RUB."),
+                     ("Комиссия $1.50.", "Комиссия 1,50 доллара."),
+                     ("Выручка $1,5 млн.", "Выручка 1,5 млн долларов."),
+                     ("Бюджет $30к.", "Бюджет 30 тыс. долларов."),
+                     ("Сальдо -$20.", "Сальдо -20 долларов."),
+                     ("Убыток -$30к.", "Убыток -30 тыс. долларов."),
+                     ("Диапазон $10–$20.", "Диапазон $10-$20.")):
+            self.assertEqual(cf.compare(a, b)["errors"], [], (a, b))
+        for a, b in (("Подписка стоит $20.", "Подписка стоит 20 рублей."),
+                     ("Подписка стоит $20.", "Подписка стоит €20."),
+                     ("Билет за 50 EUR.", "Билет за 50 USD."),
+                     ("Книга за £30.", "Книга за $30."),
+                     ("Проезд ¥100.", "Проезд 100 рублей."),
+                     ("Комиссия $1.50.", "Комиссия 1,50 рубля.")):
+            self.assertIn(("unit", "единица"), self.errs(a, b), (a, b))
+        dropped = cf.compare("Подписка стоит $20.", "Подписка стоит 20.")
+        self.assertEqual(dropped["errors"], [])
+        self.assertIn(("unit", "единица"), {(c["kind"], c["what"]) for c in dropped["checks"]})
+        self.assertIn(("lost", "число"), self.errs("Скидка $20 на 20 дней.", "Акция действует 20 дней."))
+        # A hedge before a prefix currency is attached to that number.
+        self.assertEqual([c for c in cf.compare("Цена около $20.", "Цена примерно 20 долларов.")["checks"]
+                          if c["kind"] == "hedge"], [])
+        self.assertIn(("inverted", "оговорка"), self.errs("Цена до $50.", "Цена от 50 долларов."))
+
+    def test_source_markup_does_not_hide_a_hedge(self):
+        # G-FACT-LIMITS: «минимум **2 человека**» → «2 человека» used to drop the hedge silently.
+        hedge = lambda r: [c for c in r["checks"] if c["kind"] == "hedge"]
+        self.assertEqual(len(hedge(cf.compare("Нужно минимум **2 человека**.", "Нужно 2 человека."))), 1)
+        self.assertEqual(hedge(cf.compare("Нужно минимум **2 человека**.", "Нужно не менее 2 человек.")), [])
+        self.assertIn(("inverted", "оговорка"),
+                      self.errs("Нужно не **менее** **5** человек.", "Нужно не более 5 человек."))
+        self.assertIn(("inverted", "оговорка"),
+                      self.errs("Подписка до **$20**.", "Подписка от 20 долларов."))
+
+    def test_compound_negated_hedge_ne_svyshe(self):
+        # G-FACT-LIMITS: «не свыше 5» was misread as «свыше 5» (lower bound instead of upper bound).
+        for b in ("Срок свыше 5 дней.", "Срок более 5 дней.", "Срок от 5 дней."):
+            self.assertIn(("inverted", "оговорка"), self.errs("Срок не свыше 5 дней.", b), b)
+        for b in ("Срок не более 5 дней.", "Срок максимум 5 дней.", "Срок не больше 5 дней."):
+            r = cf.compare("Срок не свыше 5 дней.", b)
+            self.assertEqual(r["errors"], [], b)
+            self.assertEqual(r["checks"], [], b)
+        r = cf.compare("Срок не свыше 5 дней.", "Срок 5 дней.")
+        self.assertIn("hedge", {c["kind"] for c in r["checks"]})
+
+    def test_swapped_amounts_across_and_joined_enumerations(self):
+        # G-FACT-LIMITS: «Анна получила 30 000 и Борис 50 000», «…, Борис 50 000 и Вера 7 000»,
+        # and coordinated senders «от Бориса и Глеба».
+        a2 = "Анна получила 30 000 и Борис 50 000."
+        self.assertIn("swap", kinds(cf.compare(a2, "Анна получила 50 000 и Борис 30 000.")))
+        self.assertEqual(cf.compare(a2, "Борис получил 50 000 и Анна 30 000.")["errors"], [])
+        a3 = "Анна получила 30 000, Борис 50 000 и Вера 7 000."
+        self.assertIn("swap", kinds(cf.compare(a3, "Анна получила 30 000, Борис 7 000 и Вера 50 000.")))
+        self.assertIn("swap", kinds(cf.compare(a3, "Анна получила 50 000, Борис 30 000 и Вера 7 000.")))
+        self.assertEqual(cf.compare(a3, "Вера получила 7 000, Анна 30 000 и Борис 50 000.")["errors"], [])
+        # Edit joins two sentences with «и» while swapping amounts.
+        s2 = "Анна получила 30 000 рублей. Борис получил 50 000 рублей."
+        self.assertIn("swap", kinds(cf.compare(s2, "Анна получила 50 000 рублей и Борис 30 000 рублей.")))
+        # Cities and number-first clauses joined by «и».
+        self.assertIn("swap", kinds(cf.compare("В Москве 12 офисов и в Казани 3 офиса.",
+                                               "В Москве 3 офиса и в Казани 12 офисов.")))
+        self.assertIn("swap", kinds(cf.compare("30 000 рублей получила Анна и 50 000 рублей получил Борис.",
+                                               "50 000 рублей получила Анна и 30 000 рублей получил Борис.")))
+        # Coordinated senders «от Бориса и Глеба» do not make Глеб a receiver.
+        snd = "Анна получила 30 000 от Бориса и Глеба, Вера — 50 000."
+        self.assertIn("swap", kinds(cf.compare(snd, "Анна получила 50 000 от Бориса и Глеба, Вера — 30 000.")))
+        self.assertEqual(cf.compare(snd, "Борис и Глеб перевели Анне 30 000, а Вера получила 50 000.")["errors"], [])
+        # Ambiguous shared amounts and non-enumeration clauses do not trigger false swaps.
+        self.assertEqual(cf.compare("Анна и Борис получили по 30 000, Вера 50 000.",
+                                    "Вера получила 50 000, а Анна и Борис по 30 000.")["errors"], [])
+        self.assertEqual(cf.compare("Анна подготовила 2 отчёта и презентацию Бориса за 3 дня. Борис проверил 5 таблиц.",
+                                    "За 3 дня Анна подготовила 2 отчёта. Презентацию Бориса приняли, он проверил 5 таблиц.")["errors"], [])
+
+    def test_leap_style_wrappers_weekday_abbr_and_academic_citations(self):
+        # leap-style s01: «с пн, 2 ноября» ↔ «с понедельника, 2 ноября» is the same weekday, while «1500 Вт» is watts.
+        self.assertEqual(self.errs("Закрыт с пн, 2 ноября, на 2 недели.",
+                                   "Закрыт с понедельника, 2 ноября, на две недели."), set())
+        self.assertIn(("lost", "дата"), self.errs("Закрыт с пн, 2 ноября.", "Закрыт со вторника, 2 ноября."))
+        self.assertIn(("added", "дата"), self.errs("Конвектор 1500 Вт в наличии.", "Конвектор 1500 Вт в наличии со вторника."))
+        # leap-style s02, s04, s08, s16: parenthetical character counts in headers and footers are service values.
+        s02 = ("**Термос «Арктика», 750 мл — спутник в походе. Держит тепло до 12 часов, холод — до 24 часов. "
+               "Гарантия 1 год. Цена 1490 руб.**\n\n(≈253 знака с пробелами — попадает в «около 250».)")
+        r02 = cf.compare(s02, "Термос «Арктика» на 750 мл для походов. Держит тепло до 12 часов, холод — до 24 часов. Гарантия 1 год, цена 1490 руб.")
+        self.assertEqual(r02["errors"], [])
+        self.assertTrue({"253", "250"} <= {s["detail"] for s in r02["service"]})
+        s08 = ("**Инструкция по возврату товара** (~241 знак):\n\n> Сохраните чек не более 14 дней.\n\n"
+               "Если нужен чуть другой тон — скажите, перепишу.")
+        r08 = cf.compare(s08, "**Инструкция по возврату товара**\nСохраните чек не более 14 дней.")
+        self.assertEqual(r08["errors"], [])
+        self.assertIn("241", {s["detail"] for s in r08["service"]})
+        # leap-style s06, s24: explicit assistant clarification tails with dates and «- "…"» bullets.
+        s06 = ("**Объявление (≈199 знаков):**\n\n> 15 ноября отключат воду.\n\n"
+               "Небольшое уточнение: год в тексте не указан (сегодня 13.11.2026). "
+               "Если нужен другой год, скажите, и я впишу его, удержав объём около 200 знаков.")
+        self.assertEqual(cf.compare(s06, "15 ноября отключат воду.")["errors"], [])
+        s24 = ("**Объявление «Сад»**\n\n```\nСкидки до 40%. Ежедневно с 9:00 до 21:00.\n```\n\n"
+               "Пара уточнений на ваше усмотрение:\n"
+               "- Год в датах не указан — если нужно, добавлю «2026» или «2027».\n"
+               "- «Ежедневно» я вывел из «часы работы с 9:00 до 21:00»; если по воскресеньям магазин закрыт, поправлю.")
+        self.assertEqual(cf.compare(s24, "В магазине «Сад» скидки до 40%. Часы работы: с 9:00 до 21:00.")["errors"], [])
+        # Academic ГОСТ citations [14, с. 52] and [3; 7] keep their numbers and do not hide sentence starts.
+        self.assertEqual(self.errs("Это подтверждено опытами.[14, с. 52] Однако авторы спорят [3; 7].",
+                                   "Это подтверждено опытами [14, с. 52], но авторы спорят [3; 7]."), set())
+        self.assertIn(("lost", "число"), self.errs("По данным Иванова [14, с. 52], рост составил 5%.",
+                                                   "По данным Иванова, рост составил 5%."))
+        # Mixed-script Latin/Greek homoglyphs, NFD й/ё, uppercase/citeturn citations, and sentence-start
+        # verbs/headings («Дарим» vs «Дарья», «Верим» vs «Вера», «Лид» vs «Лидия») do not cause false losses.
+        self.assertEqual(cf.compare("Пришла Вepa и получила $20 в «Зepно» [CITE: 8] [WEB:2]citeturn0search3.",
+                                    "Пришла Вера и получила 20 долларов в «Зерно».")["errors"], [])
+        self.assertEqual(cf.compare("Ε\u0308лка и ключевои\u0306 οпыт Βερы, ΓОСТ и ΠΡИΜΕΡ.",
+                                    "Ёлка и ключевой опыт Веры, ГОСТ и ПРИМЕР.")["errors"], [])
+        # NFD currency swap and Russian stress marks U+0301 (ударе́ние) in check_facts.
+        self.assertIn(("unit", "единица"),
+                      self.errs("Арте\u0308м заплатил 500 рублеи\u0306.", "Артём заплатил 500 долларов."))
+        self.assertEqual(cf.compare("Замо\u0301к на двери сто\u0301ит 500 рубле\u0301й.",
+                                    "Замок на двери стоит 500 рублей.")["errors"], [])
+        self.assertEqual(cf.compare("Актуальность\u2800темы и\u3164выводы.",
+                                    "Актуальность темы и выводы.")["errors"], [])
+        self.assertEqual(cf.compare("Дарим вам десерт на двоих до 31 декабря.",
+                                    "Угостим вас десертом на двоих до 31 декабря.")["errors"], [])
+        self.assertEqual(cf.compare("Верим в команду. **Лид:** 15 января запустили цех.",
+                                    "Надеемся на команду. 15 января запустили цех.")["errors"], [])
+        self.assertIn(("lost", "имя или название"),
+                      self.errs("Дарье подарили десерт на двоих.", "Подарили десерт на двоих."))
+
+    def test_swapped_item_numbers_and_generated_item_lists(self):
+        # R-FACTS / G-FACT-LIMITS: item/product/tariff number swaps in lowercase and capitalised lists.
+        for a, b in (
+            ("капучино 250 ₽, латте 300 ₽", "капучино 300 ₽, латте 250 ₽"),
+            ("капучино — 250 ₽, латте — 300 ₽", "капучино — 300 ₽, латте — 250 ₽"),
+            ("Эспрессо: 180 ₽; Американо: 220 ₽ и Капучино: 260 ₽",
+             "Эспрессо: 220 ₽; Американо: 180 ₽ и Капучино: 260 ₽"),
+            ("Эспрессо: 180 ₽; Американо: 220 ₽ и Капучино: 260 ₽",
+             "Эспрессо: 220 ₽; Американо: 260 ₽ и Капучино: 180 ₽"),
+            ("тариф Базовый — 500 ₽, тариф Про — 900 ₽", "тариф Базовый — 900 ₽, тариф Про — 500 ₽"),
+            ("тариф базовый — 500 ₽, тариф про — 900 ₽", "тариф базовый — 900 ₽, тариф про — 500 ₽"),
+            ("Базовый — 500 ₽, Про — 900 ₽.", "Базовый — 900 ₽, Про — 500 ₽."),
+            ("Тариф «Базовый» — 500 ₽, тариф «Про» — 900 ₽.", "Базовый стоит 900 ₽, Про — 500 ₽."),
+            ("- капучино: 250 ₽\n- латте: 300 ₽", "- капучино: 300 ₽\n- латте: 250 ₽"),
+            ("| Напиток | Цена |\n| Капучино | 250 ₽ |\n| Латте | 300 ₽ |",
+             "В меню капучино за 300 ₽ и латте за 250 ₽."),
+            ("чёрный чай — 180 ₽, зелёный чай — 220 ₽", "чёрный чай — 220 ₽, зелёный — 180 ₽"),
+            ("латте — 280 ₽, айс латте — 320 ₽", "айс латте — 280 ₽, латте — 320 ₽"),
+        ):
+            r = cf.compare(a, b)
+            self.assertIn(("swap", "привязка"), {(e["kind"], e["what"]) for e in r["errors"]}, (a, b))
+            self.assertIn("перепутана привязка", cf.render(r))
+        # Reordering, rephrasing where labels disappear, shared prices, ordinals and narrative clauses stay clean.
+        for a, b in (
+            ("капучино 250 ₽, латте 300 ₽", "латте 300 ₽, капучино 250 ₽"),
+            ("капучино — 250 ₽, латте — 300 ₽", "Латте стоит 300 ₽, а капучино — 250 ₽."),
+            ("Эспрессо: 180 ₽; Американо: 220 ₽ и Капучино: 260 ₽",
+             "Капучино — 260 ₽, эспрессо — 180 ₽, американо — 220 ₽."),
+            ("капучино 250 ₽, латте 300 ₽", "маленькая чашка 250 ₽, большая молочная чашка 300 ₽"),
+            ("капучино 250 ₽, латте 300 ₽", "капучино 250 ₽, а большая чашка с молоком — 300 ₽"),
+            ("капучино и латте по 250 ₽, раф 350 ₽", "латте и капучино по 250 ₽, раф 350 ₽"),
+            ("Команда провела 2 встречи, клиенты прислали 5 заявок.",
+             "Клиенты после 2 встреч остались довольны, а команда разобрала 5 заявок."),
+            ("Клиенты за 2 дня собрали документы, менеджеры за 5 дней проверили отчёты.",
+             "Менеджеры за 2 дня собрали документы, клиенты за 5 дней проверили отчёты."),
+            ("Первый вариант — 250 ₽, второй вариант — 300 ₽.",
+             "Первый вариант — 300 ₽, второй вариант — 250 ₽."),
+            ("Тариф Базовый — 500 ₽, тариф Про — 900 ₽.",
+             "Тариф Базовый — 500 ₽. Тариф Про — 900 ₽. Это просто: скидка 500 ₽."),
+        ):
+            self.assertEqual(cf.compare(a, b)["errors"], [], (a, b))
+        self.assertIn(("swap", "привязка"), self.errs(
+            "На выбор два тарифа: Базовый — 500 ₽ и Про — 900 ₽.",
+            "На выбор два тарифа: Базовый — 900 ₽ и Про — 500 ₽.",
+        ))
+        self.assertEqual(cf.compare(
+            "На выбор два тарифа: Базовый — 500 ₽ и Про — 900 ₽.",
+            "На выбор два тарифа: Про — 900 ₽ и Базовый — 500 ₽.",
+        )["errors"], [])
+        # Generated item-list permutations across 12 shapes (2-4 items, 300 pairs): reorder/reshape = 0 errors,
+        # swapped pair or cycle = swap error.
+        items_pool = [
+            ("капучино", "капучино"), ("латте", "латте"), ("эспрессо", "эспрессо"),
+            ("американо", "американо"), ("раф", "рафа"), ("какао", "какао"),
+            ("тариф базовый", "тарифа базового"), ("тариф про", "тарифа про"),
+        ]
+        prices = ["180", "220", "250", "300", "350", "420", "500", "900"]
+
+        def join_and(xs):
+            return xs[0] if len(xs) == 1 else ", ".join(xs[:-1]) + " и " + xs[-1]
+
+        shapes = {
+            "space": lambda ps: ", ".join("%s %s ₽" % (it[0], v) for it, v in ps) + ".",
+            "dash": lambda ps: ", ".join("%s — %s ₽" % (it[0], v) for it, v in ps) + ".",
+            "colon_semi": lambda ps: "; ".join("%s: %s ₽" % (it[0].capitalize(), v) for it, v in ps) + ".",
+            "and_space": lambda ps: join_and(["%s %s ₽" % (it[0], v) for it, v in ps]) + ".",
+            "and_colon": lambda ps: "; ".join("%s: %s ₽" % (it[0].capitalize(), v) for it, v in ps[:-1])
+                                    + " и %s: %s ₽." % (ps[-1][0][0].capitalize(), ps[-1][1]),
+            "za": lambda ps: ", ".join("%s за %s ₽" % (it[0], v) for it, v in ps) + ".",
+            "stoit": lambda ps: ", ".join(("%s стоит %s ₽" % (it[0], v)) if i == 0 else ("%s — %s ₽" % (it[0], v))
+                                          for i, (it, v) in enumerate(ps)) + ".",
+            "parens": lambda ps: ", ".join("%s (%s ₽)" % (it[0], v) for it, v in ps) + ".",
+            "lead_colon": lambda ps: "Меню: " + ", ".join("%s — %s ₽" % (it[0], v) for it, v in ps) + ".",
+            "lead_verb": lambda ps: "В меню есть " + join_and(["%s за %s ₽" % (it[0], v) for it, v in ps]) + ".",
+            "bullets": lambda ps: "Цены:\n" + "\n".join("- %s: %s ₽" % (it[0], v) for it, v in ps),
+            "u_gen": lambda ps: ", ".join("у %s — %s ₽" % (it[1], v) for it, v in ps) + ".",
+            "table": lambda ps: "| позиции | цены |\n" + "\n".join("| %s | %s ₽ |" % (it[0], v) for it, v in ps),
+        }
+        rng = random.Random(4300)
+        for _ in range(300):
+            k = rng.choice((2, 3, 4))
+            sample = rng.sample(items_pool, k)
+            # Keep both tariff items together only when testing tariff pairs, or mix freely with drinks.
+            vals = rng.sample(prices, k)
+            pairs = list(zip(sample, vals))
+            s1, s2 = rng.choice(sorted(shapes)), rng.choice(sorted(shapes))
+            before = shapes[s1](pairs)
+            moved = pairs[:]
+            rng.shuffle(moved)
+            after_ok = shapes[s2](moved)
+            self.assertEqual(cf.compare(before, after_ok)["errors"], [], "%s -> %s\n%s\n%s" % (s1, s2, before, after_ok))
+            i, j = rng.sample(range(k), 2)
+            wrong = pairs[:]
+            wrong[i], wrong[j] = (pairs[i][0], pairs[j][1]), (pairs[j][0], pairs[i][1])
+            rng.shuffle(wrong)
+            after_bad = shapes[s2](wrong)
+            self.assertIn("swap", kinds(cf.compare(before, after_bad)), "%s -> %s\n%s\n%s" % (s1, s2, before, after_bad))
+
+    def test_currency_ranges_yen_yuan_pounds_and_negative_decimals(self):
+        # Wave-3 (#56, #63): currency ranges, JPY vs CNY, lb vs £, negative dot-decimals, stress shift in quotes,
+        # «15 мае», uppercase URLs, coordinated sender edge cases, and huge decimals.
+        self.assertIn(("unit", "единица"), self.errs("Цена $20–30.", "Цена 20–30 рублей."))
+        self.assertIn(("unit", "единица"), self.errs("Цена $1.50–2.50.", "Цена от $1.50 до 2.50 €."))
+        for a, b in (("Цена $20–30.", "Цена 20–30 долларов."),
+                     ("Цена от $20 до $30.", "Цена от 20 до 30 долларов."),
+                     ("Работаем 9.00-12.30.", "Работаем 9:00–12:30."),
+                     ("Встреча 15 мае 2026.", "Встреча 15 мая 2026."),
+                     ("Сайт HTTPS://Example.COM/Path/ и WWW.Test.RU", "Сайт https://example.com/Path/ и www.test.ru")):
+            r = cf.compare(a, b)
+            self.assertEqual(r["errors"], [], (a, b))
+            self.assertEqual([c for c in r["checks"] if c["kind"] == "unit"], [], (a, b))
+        # Spaced clause dash does not bleed units onto an item number.
+        self.assertIn(("unit", "единица"),
+                      {(c["kind"], c["what"]) for c in cf.compare("Заказ 15 ₽ — 300 рублей.", "Заказ 15 — 300 рублей.")["checks"]})
+        # Negative dot-decimals are not positive clock times.
+        self.assertIn(("lost", "число"), self.errs("Отметка -12.30.", "Отметка 12:30."))
+        self.assertIn(("lost", "число"), self.errs("Сдвиг -1.50.", "Сдвиг 1,50."))
+        # JPY vs CNY and weight pounds vs GBP.
+        self.assertIn(("unit", "единица"), self.errs("Цена 20 JPY.", "Цена 20 CNY."))
+        self.assertIn(("unit", "единица"), self.errs("Цена 100 иен.", "Цена 100 юаней."))
+        self.assertIn(("unit", "единица"), self.errs("Вес посылки 20 фунтов.", "Вес посылки £20."))
+        self.assertIn(("unit", "единица"), self.errs("Вес 20 фунтов.", "Вес £20."))
+        # Uppercase URL with mixed-script path is preserved, and code invisibles are compared as code.
+        self.assertIn(("lost", "ссылка"), self.errs("См. HTTPS://a.ru/Кoлoc", "См. HTTPS://a.ru/Колос"))
+        self.assertIn(("lost", "код"), self.errs("Код `x = 'a\u2062b'`.", "Код `x = 'ab'`."))
+        # Direct-speech stress shift (за́мок → замо́к) is caught while prose stress removal stays clean.
+        self.assertIn(("lost", "цитата"),
+                      self.errs("Он сказал: «Я вижу за\u0301мок».", "Он сказал: «Я вижу замо\u0301к»."))
+        self.assertEqual(cf.compare("Он сказал: «Я вижу за\u0301мок».", "Он сказал: «Я вижу замок».")["errors"], [])
+        # Coordinated sender does not swallow a real receiver after «от клиента и Анна» or «от Бориса и Вера — 50 000».
+        self.assertIn(("swap", "привязка"), self.errs(
+            "Анна получила 30 000 рублей, а Борис получил 50 000 рублей.",
+            "Мы получили заказ от клиента и Анна оформила его на 50 000 рублей, а Борис — на 30 000 рублей.",
+        ))
+        self.assertIn(("swap", "привязка"), self.errs(
+            "Анна получила 30 000 от Бориса и Вера — 50 000.",
+            "Анна получила 50 000 от Бориса, а Вера — 30 000.",
+        ))
+        # Huge decimals & scales do not raise OverflowError and still distinguish digits.
+        self.assertIn(("lost", "число"), self.errs("Число " + "9" * 310 + ".5.", "Число " + "9" * 310 + ".6."))
+        self.assertEqual(cf.compare("Число " + "9" * 307 + ",5 млн.", "Число " + "9" * 307 + "500000.")["errors"], [])
+        # Gate M2 (#70): Russian indirect polar question «не был ли» ↔ «болен ли был» is not an inverted negation,
+        # while losing both «не» and «ли» or plain «не был» → «был» stays an error; team score before «, а на счету X»
+        # is not falsely bound to X.
+        self.assertEqual(cf.compare(
+            "Экспертиза должна определить, не был ли лось болен бешенством.",
+            "Экспертиза: нужно выяснить, болен ли был лось бешенством.",
+        )["errors"], [])
+        self.assertIn(("inverted", "отрицание"), self.errs("Лось не был болен бешенством.", "Лось был болен бешенством."))
+        self.assertIn(("inverted", "отрицание"), self.errs(
+            "Экспертиза должна определить, не был ли лось болен.", "Лось был болен."
+        ))
+        self.assertEqual(cf.compare(
+            "Защитник Сергей Гончар из 'Вашингтон Капиталз' стал лучшим против 'Нью-Йорк Рейнджерс'. "
+            "Столичная команда разгромила своих соперников со счетом 7:2, а на счету Гончара - один гол и три передачи. "
+            "\"Вашингтон Кэпиталз\" побеждает.",
+            "Защитник Сергей Гончар из «Вашингтон Капиталз» стал лучшим против «Нью-Йорк Рейнджерс». "
+            "«Вашингтон Кэпиталз» разгромили соперников со счетом 7:2, на счету Гончара один гол и три передачи.",
+        )["errors"], [])
+        # Surname in source («Гончара» with 7:2) expanded to full name («Сергей Гончар» with 7:2) while «2» is bound elsewhere.
+        self.assertEqual(cf.compare(
+            "Защитник Сергей Гончар из «Вашингтон Кэпиталз» сыграл против «Рейнджерс». "
+            "Команда победила со счетом 7:2, а на счету Гончара три передачи. "
+            "«Вашингтон Кэпиталз» два раза брали тайм-аут.",
+            "Защитник Сергей Гончар разгромил с командой «Рейнджерс» со счетом 7:2 и отдал три передачи. "
+            "«Вашингтон Кэпиталз» два раза брали тайм-аут.",
+        )["errors"], [])
+        # Keycap emoji bullets (1️⃣, 2️⃣) are decorative icons, not factual prose numbers.
+        self.assertEqual(cf.compare(
+            "1\ufe0f\u20e3 Тариф Базовый: 500 ₽; 2\ufe0f\u20e3 Тариф Про: 900 ₽.",
+            "Тариф Про — 900 ₽; тариф Базовый — 500 ₽.",
+        )["errors"], [])
+        # Cross-review F1, F2a, F3, F4, F5, F6, F7, F9 (#102):
+        self.assertIn(("unit", "единица"), self.errs("Цена $20 с доставкой.", "Цена €20 с доставкой."))
+        self.assertEqual(cf.compare("Цена $20 с доставкой.", "Цена 20 долларов с доставкой.")["errors"], [])
+        self.assertIn(("lost", "ссылка"), self.errs(
+            "См. https://example.org/citeturn0search1/report здесь.",
+            "См. https://example.org//report здесь.",
+        ))
+        self.assertIn(("unit", "единица"), self.errs("Купили гири по 5 фунтов.", "Купили гири по £5."))
+        self.assertIn(("lost", "число"), self.errs(
+            "Приложите аннотацию (до 500 слов) к заявке на участие в конкурсе.\n\nЗаявки принимаются до 10 мая.",
+            "Приложите аннотацию к заявке на участие в конкурсе.\n\nЗаявки принимаются до 10 мая.",
+        ))
+        self.assertIn(("lost", "блок кода"), {
+            (c["kind"], c["what"])
+            for c in cf.compare("```js\nconst strip = /\u2062/g;\n```", "```js\nconst strip = //g;\n```")["checks"]
+        })
+        self.assertIn(("lost", "код"), self.errs("Код `const strip = /\u2062/g`.", "Код `const strip = //g`."))
+        self.assertIn(("lost", "блок кода"), {
+            (c["kind"], c["what"])
+            for c in cf.compare("```js\nconst label = `a\u2062b`;\n```", "```js\nconst label = `ab`;\n```")["checks"]
+        })
+        self.assertEqual(
+            cf.compare(
+                "Он сказал: «за\u0301мок». Она уточнила: «замо\u0301к».",
+                "Он сказал: «за\u0301мок». Она уточнила: «за\u0301мок».",
+            )["errors"],
+            [{"kind": "lost", "what": "цитата", "detail": "«замо\u0301к»"}],
+        )
+        self.assertIn(("lost", "код"), self.errs("Переменная `s = 'за\u0301мок'`.", "Переменная `s = 'замо\u0301к'`."))
+        self.assertIn(("lost", "ссылка"), self.errs(
+            "Ссылка https://example.org/за\u0301мок открыта.",
+            "Ссылка https://example.org/замо\u0301к открыта.",
+        ))
+
+    def test_algorithmic_bounds_on_adversarial_inputs(self):
+        import time
+        t0 = time.time()
+        s_and = "Анна 1" + " и Анна 1" * 1200 + " и Борис и Вера 2."
+        self.assertEqual(cf.compare(s_and, s_and)["errors"], [])
+        s_item_and = "товар0 10" + "".join(" и товар%d %d" % (i + 1, 11 + i) for i in range(1100))
+        self.assertEqual(cf.compare(s_item_and, s_item_and)["errors"], [])
+        s_item_comma = ", ".join("товар%d %d" % (i, 10 + i) for i in range(1000))
+        self.assertEqual(cf.compare(s_item_comma, s_item_comma)["errors"], [])
+        s_slot0 = "чай 5, " + ", ".join("кофе сорта%d %d" % (i, 10 + i) for i in range(800))
+        self.assertEqual(cf.compare(s_slot0, s_slot0)["errors"], [])
+        s_slot0_sw = "чай 10, кофе сорта0 5, " + ", ".join("кофе сорта%d %d" % (i, 10 + i) for i in range(1, 800))
+        self.assertEqual([e["kind"] for e in cf.compare(s_slot0, s_slot0_sw)["errors"]], ["swap", "swap"])
+        s_dup_sig = "чай 5, " + ", ".join("кофе зерновой 10" for _ in range(1000))
+        self.assertEqual(cf.compare(s_dup_sig, s_dup_sig)["errors"], [])
+        unclosed_q = "```python\n'" + "\\'" * 20000 + "\n```"
+        self.assertEqual(cf.compare(unclosed_q, unclosed_q)["errors"], [])
+        unclosed_dq = '```python\n"' + '\\"' * 20000 + "\n```"
+        self.assertEqual(cf.compare(unclosed_dq, unclosed_dq)["errors"], [])
+        self.assertEqual(cf.compare("a" * 40000, "a" * 40000)["errors"], [])
+        nums = "1, " * 15000 + "1"
+        self.assertEqual(cf.compare(nums, nums)["errors"], [])
+        negs = " ".join("не слово%d" % (i % 200) for i in range(4000))
+        self.assertEqual(cf.compare(negs, negs)["errors"], [])
+        names = " ".join("Имя%d" % i for i in range(5000))
+        self.assertEqual(cf.compare(names, names)["errors"], [])
+        quotes = " ".join("«слово%d»" % i for i in range(4000))
+        self.assertEqual(cf.compare(quotes, quotes)["errors"], [])
+        # Upstream CI allows 4 s. This fork runs the same guard with a 6 s
+        # ceiling: it still catches quadratic blow-ups, and the local run
+        # takes about 4 s on the reference machine.
+        self.assertLess(time.time() - t0, 6.0)
+
+
+class CleanPasteTest(unittest.TestCase):
+    def test_utm_tail_in_markup_html_and_before_invisible(self):
+        for src, want in (("Сайт https://a.ru/x?utm_source=chatgpt.com\u200b готов.", "Сайт https://a.ru/x готов."),
+                          ("**https://a.ru/p?utm_source=chatgpt.com**", "**https://a.ru/p**"),
+                          ("https://a.ru/p?utm_source=chatgpt.com&amp;id=1", "https://a.ru/p?id=1"),
+                          ("https://a.ru/p?id=1&amp;utm_source=chatgpt.com", "https://a.ru/p?id=1"),
+                          ("Сайт www.a.ru/x?utm_source=chatgpt.com", "Сайт www.a.ru/x"),
+                          ("Хост https://[::1]/ доступен.", "Хост https://[::1]/ доступен.")):
+            self.assertEqual(cp.clean(src)[0], want, src)
+
+    def test_cite_start_keeps_the_space_and_code_is_untouched(self):
+        self.assertEqual(cp.clean("Текст [cite_start]первый[cite: 1].")[0], "Текст первый.")
+        code = '`print("[cite: 1]")` и\n```bash\ncurl https://a.ru/p?utm_source=chatgpt.com\n```\n'
+        self.assertEqual(cp.clean(code), (code, {}))
+        prose = "```markdown\nПривет, это пост про кофе :contentReference[oaicite:1]{index=1}.\n```\n"
+        self.assertEqual(cp.clean(prose)[0], "```markdown\nПривет, это пост про кофе.\n```\n")
+
+    def test_code_block_with_windows_line_endings_is_untouched(self):
+        code = "```bash\r\ncurl https://a.ru/p?utm_source=chatgpt.com\r\n```\r\n"
+        self.assertEqual(cp.clean(code), (code, {}))
+
+    def test_in_place_keeps_windows_line_endings(self):
+        with tempfile.TemporaryDirectory() as tmp_dir:
+            f = Path(tmp_dir) / "a.txt"
+            f.write_bytes("Текст\u200b\r\nВторая\r\n".encode("utf-8"))
+            subprocess.run([sys.executable, str(SCRIPTS / "clean_paste.py"), str(f), "--in-place"], capture_output=True)
+            self.assertEqual(f.read_bytes(), "Текст\r\nВторая\r\n".encode("utf-8"))
+
+    def test_content_reference(self):
+        text, counts = cp.clean("Рост заявок :contentReference[oaicite:3]{index=3}. Дальше.")
+        self.assertEqual(text, "Рост заявок. Дальше.")
+        self.assertEqual(counts, {"contentReference": 1})
+
+    def test_source_tokens_and_cite(self):
+        text, _ = cp.clean("Факт【4:2†source】 и ещё [cite: 1, 2] факт.")
+        self.assertEqual(text, "Факт и ещё факт.")
+
+    def test_utm_tail_keeps_link(self):
+        # R-PASTE: the assistant's utm_source tail goes, the link and its other parameters stay.
+        text, _ = cp.clean("См. https://a.ru/p?utm_source=chatgpt.com и https://b.ru/q?id=1&utm_source=openai.")
+        self.assertEqual(text, "См. https://a.ru/p и https://b.ru/q?id=1.")
+        text, _ = cp.clean("https://a.ru/p?utm_source=chatgpt.com&id=1")
+        self.assertEqual(text, "https://a.ru/p?id=1")
+
+    def test_author_utm_tags_stay(self):
+        # R-PASTE (2026-10-21): utm tags the author put in a newsletter are not chat leftovers.
+        src = "Записаться: https://shop.example.ru/sale?utm_source=newsletter&utm_campaign=autumn"
+        self.assertEqual(cp.clean(src), (src, {}))
+        text, counts = cp.clean("https://example.org/?utm_campaign=a&id=42&utm_source=openai#top")
+        self.assertEqual(text, "https://example.org/?utm_campaign=a&id=42#top")
+        self.assertEqual(counts["utm"], 1)
+        self.assertEqual(cp.clean(text), (text, {}))
+
+    def test_invisible_characters(self):
+        text, counts = cp.clean("при\u200bвет\u00ad мир\ufeff")
+        self.assertEqual(text, "привет мир")
+        self.assertEqual(counts["invisible"], 3)
+
+    def test_emoji_joiner_and_nbsp_survive(self):
+        family = "\U0001F468\u200d\U0001F469\u200d\U0001F467"
+        src = "Семья " + family + " и 240\u00a0₽"
+        text, counts = cp.clean(src)
+        self.assertEqual(text, src)
+        self.assertEqual(counts, {})
+
+    def test_clean_text_untouched(self):
+        src = "Обычный текст — с тире, «ёлочками» и ссылкой https://a.ru/x?id=2."
+        self.assertEqual(cp.clean(src), (src, {}))
+
+    def test_utm_tail_after_parentheses_in_link(self):
+        # 4.1.7: the link pattern stopped at ")", so the tail after "(значения)" stayed.
+        for src, want in (("https://ru.wikipedia.org/wiki/Колос_(значения)?utm_source=chatgpt.com",
+                           "https://ru.wikipedia.org/wiki/Колос_(значения)"),
+                          ("[Колос](https://ru.wikipedia.org/wiki/Колос_(значения)?utm_source=chatgpt.com).",
+                           "[Колос](https://ru.wikipedia.org/wiki/Колос_(значения))."),
+                          ("(см. https://a.ru/x?utm_source=chatgpt.com)", "(см. https://a.ru/x)")):
+            self.assertEqual(cp.clean(src)[0], want, src)
+
+    def test_homoglyphs_and_modern_assistant_utms(self):
+        # R-DETECTOR-RISK / R-PASTE: fold pure Cyrillic+Latin/Greek homoglyph spoofing inside Russian words
+        # (including NFD й/ё), strip modern assistant utm_source tags, Unicode Tags, non-emoji Variation
+        # Selectors, and bare citeturn leaks, while leaving code, URLs, emails, emoji and non-homoglyphs intact.
+        text, counts = cp.clean("Новaя cиcтeмa, οпыт Cбepa, ΓОСТ, ΠΡИΜΕΡ и Φорма за 990pуб., cтo\u0301ит.")
+        self.assertEqual(text, "Новая система, опыт Сбера, ГОСТ, ПРИМЕР и Форма за 990руб., сто\u0301ит.")
+        self.assertEqual(counts, {"homoglyph": 9})
+        combo, counts2 = cp.clean("c\u200bиcт\u00adeмoи\u0306 и e\u0308рш")
+        self.assertEqual(combo, "системой и ёрш")
+        self.assertEqual(counts2, {"homoglyph": 2, "invisible": 2})
+        self.assertEqual(cp.clean(combo), (combo, {}))
+        # Braille blank U+2800 and Hangul fillers replace with space instead of gluing words together.
+        spoofer, cs_sp = cp.clean("\u2800актуальность\u2800\u2800темы \u3164и\uffa0выводы\u034f\u061c\u2800")
+        self.assertEqual(spoofer, "актуальность темы и выводы")
+        self.assertEqual(cs_sp, {"invisible": 8})
+        for untouched in ("IT-отдел, SIM-карта, 3D, 1С, 160x200, 30k и С2H5OH.",
+                          "В `cиcтeмa` и https://a.ru/Кoлoc и ivan@cиcтeмa.ru ничего не трогаем.",
+                          "```python\nx = 'cиcтeмa'\n```\n",
+                          "Сбой модели в словах epicентре и αλфавит остаётся для линтера стиля.",
+                          "Дореформенное блокши\u0301ф(в)ъ, вниманія, порядкѣ и є не трогаем.",
+                          "Эмодзи ❤️, ⏱️, 1️⃣ и флаг 🏴\U000e0067\U000e0062\U000e0065\U000e006e\U000e0067\U000e007f на месте."):
+            self.assertEqual(cp.clean(untouched), (untouched, {}), untouched)
+        for utm in ("copilot.com", "perplexity.ai", "claude.ai", "gemini.google.com", "grok.com", "chat.deepseek.com"):
+            cleaned, c = cp.clean("См. https://a.ru/p?id=1&utm_source=" + utm)
+            self.assertEqual(cleaned, "См. https://a.ru/p?id=1", utm)
+            self.assertEqual(c, {"utm": 1}, utm)
+        # 2025-2026 PUA/citation tokens, bare citeturn, Unicode Tags and Variation Selector steganography
+        stego, cs = cp.clean(
+            "Факт\ue200cite\ue202turn0search3\ue201\uea012\uea02citeturn0news1"
+            " [Cite: 8] [citation:2] [^1^]\ufe01текст\ufe0f\U000e0068\U000e0105."
+        )
+        self.assertEqual(stego, "Факттекст.")
+        self.assertEqual(cs, {"cite": 3, "invisible": 4, "oaicite": 3})
+
+    def test_code_span_invisibles_uppercase_urls_and_idempotency(self):
+        # Wave-3 (#56, #63): code spans protect invisibles, HTTPS:// & WWW. URLs keep paths and strip assistant UTMs,
+        # ZWJ + VS16 and invisibles inside citations/URLs are 100% idempotent in one clean() call.
+        for code in ("Код `x = 'a\u2062b'` тут.", "```python\nx = 'a\u200bb'\n```\n",
+                     "```js\nconst strip = /\u2062/g;\nconst label = `a\u2062b`;\n```",
+                     "Код `const strip = /\u2062/g` тут.",
+                     "См. https://example.org/citeturn0search1/report здесь.",
+                     "См. [описание](./cайт.md) в папке.",
+                     "См. HTTPS://a.ru/Кoлoc и WWW.a.ru/Кoлoc."):
+            self.assertEqual(cp.clean(code), (code, {}), code)
+        self.assertEqual(cp.clean("[Новaя cиcтeмa](./cайт.md)"), ("[Новая система](./cайт.md)", {"homoglyph": 2}))
+        self.assertEqual(cp.clean("См. HTTPS://a.ru/Кoлoc?utm_source=chatgpt.com"),
+                         ("См. https://a.ru/Кoлoc", {"utm": 1}))
+        for preserved in ("Огонь ❤️\u200d🔥 и флаг 🏳️\u200d🌈 и семья 👨\u200d👩\u200d👧.",):
+            self.assertEqual(cp.clean(preserved), (preserved, {}), preserved)
+        for raw, want in (
+            ("слово\ufe0f\u200dслово", "словослово"),
+            ("слово\u200d\ufe0fслово", "словослово"),
+            ("Привет 😀\u200d\u200b", "Привет 😀"),
+            ("Старт 🚀\u200dслово", "Старт 🚀слово"),
+            ("Текст cite\u200bturn0search3 [cite:\u200b 1].", "Текст."),
+            ("https://a.ru/?a=1\u200b&utm_source=chatgpt.com", "https://a.ru/?a=1"),
+            ("[cite: [cite: 1]2]Готово.", "Готово."),
+            ("Код `pg_Cancels\ufeff(pid)` и `act\xadive_locks=0`.", "Код `pg_Cancels(pid)` и `active_locks=0`."),
+            ("```bash\ncsvtidy input\ufeff.csv -\xad-dry-run\n```\n", "```bash\ncsvtidy input.csv --dry-run\n```\n"),
+            ("`\u200b```markdown\n# Заголовок\n````", "````markdown\n# Заголовок\n````"),
+        ):
+            once, c1 = cp.clean(raw)
+            self.assertEqual(once, want, raw)
+            self.assertTrue(c1, raw)
+            self.assertEqual(cp.clean(once), (once, {}), raw)
+        import time
+        t0 = time.time()
+        self.assertEqual(cp.clean("a" * 50000), ("a" * 50000, {}))
+        self.assertEqual(cp.clean("\u200b\u200c\u200d\u2800" * 25000), ("", {"invisible": 100000}))
+        unclosed_cp = "```python\na\u200b'" + "\\'" * 25000 + "\n```"
+        self.assertEqual(cp.clean(unclosed_cp), ("```python\na'" + "\\'" * 25000 + "\n```", {"invisible": 1}))
+        unclosed_cp_dq = '```python\na\u200b"' + '\\"' * 25000 + "\n```"
+        self.assertEqual(cp.clean(unclosed_cp_dq), ('```python\na"' + '\\"' * 25000 + "\n```", {"invisible": 1}))
+        fenced = "```js\nx=1\n```\n" * 1500 + "`y` " * 3000
+        self.assertEqual(cp.clean(fenced), (fenced, {}))
+        self.assertLess(time.time() - t0, 1.5)
+
+
+if __name__ == "__main__":
+    unittest.main()

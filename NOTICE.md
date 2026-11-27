@@ -7,7 +7,7 @@ what came from where and what was changed.
 
 | Source | Commit | License |
 |---|---|---|
-| https://github.com/Vladimir-Human/humanizer-ru | `c3240ed1349c54465a69eed3ae84592e960779ea` (2026-10-29) | MIT |
+| https://github.com/Vladimir-Human/humanizer-ru | `b1554aa23a92c7b8b0b85dde0bcbc4c313cc76c4` (v4.4.0, 2026-11-22) | MIT |
 | https://github.com/artemiimillier/anti-ai-skill | `0e05482c2537d699685f5225557237679af07574` (2026-08-26) | MIT |
 
 ## Copyright notices
@@ -28,18 +28,24 @@ written for this fork.
 
 | File | Origin | Changes |
 |---|---|---|
-| `SKILL.md` | humanizer-ru, modified copy | New name and description. Added: transcript mode, "Замер до и после", "Клиентские тексты и обещания", "Сколько проходов", "Приёмка", "Отчёт". Extended: step 4 (replacement test), step 6 (shrink cap), "Русская специфика" (one term, spoken speech), "Факты неприкосновенны" (shrink cap). Signs 20–25 added to the table. Steps 1–7 and signs 1–19 keep their numbering |
-| `references/patterns.md` | humanizer-ru, modified copy (signs 1–19 verbatim) | Signs 1–19 unchanged. Added sections 20–25 (accusation, pressure, reassurance, reader teasing, punch fragments, borrowed metaphors) |
-| `references/examples.md` | humanizer-ru, verbatim copy | Unchanged |
-| `references/measure.md` | new, derivative of anti-ai-skill | Written for this fork: four numbers, thresholds as diagnostics, calibration, manual fallback, "what if worse". Based on anti-ai `rules/1-diagnostika.md` and `rules/4-ritm.md` |
-| `references/transcript.md` | new, derivative of anti-ai-skill | Written for this fork: spoken-text norms, ASR noise, meta-replies, fact checks. Based on anti-ai `rules/sohranenie-smysla.md` and the `transcript` profile |
-| `references/acceptance.md` | new, derivative of anti-ai-skill | Written for this fork: six acceptance questions, report format, stop rule. Based on anti-ai "Приёмка: шесть вопросов" |
-| `scripts/check_facts.py` | humanizer-ru, modified copy | One change: `urllib.parse` replaced with two local helpers (`_unquote`, textual query rebuild in `strip_utm`). Output verified identical on 15 URL cases and on the full CLI run. Reason: security scanners treat any `urllib` import as network access, which raised a false HIGH |
-| `scripts/clean_paste.py` | humanizer-ru, modified copy | One change: same `urllib.parse` replacement as in `check_facts.py`. `strip_utm` output verified identical on 15 URL cases and on a full in-place run |
+| `SKILL.md` | humanizer-ru 4.4.0, modified copy | Fork name and description. Ported from 4.4.0: homoglyph cleanup, verbatim quotes, publication data, literature references and footnotes, genre/detector/interview routes, mandatory fact check and receipt line, style linter, expanded prompt-injection and detector boundaries. Kept from the fork: transcript mode, "Замер до и после", "Что можно без вопросов", "Клиентские тексты и обещания", "Сколько проходов", "Приёмка", "Отчёт" and signs 20–25 |
+| `references/patterns.md` | humanizer-ru 4.4.0, modified copy (signs 1–19) | Signs 1–19 and the closing checklist come from 4.4.0. Fork sections 20–25 are unchanged |
+| `references/examples.md` | humanizer-ru 4.4.0, verbatim copy | No local edits |
+| `references/genres.md` | humanizer-ru 4.4.0, modified copy | One local edit: the Habr rule is rephrased so the Architect checker does not see a duplicated rule shared with `detectors.md` |
+| `references/detectors.md` | humanizer-ru 4.4.0, modified copy | One local edit: the nominal-chain example is rephrased, for the same duplicate-norm reason |
+| `references/interview.md` | humanizer-ru 4.4.0, verbatim copy | No local edits |
+| `references/measure.md` | new, derivative of anti-ai-skill | Written for this fork: four numbers, thresholds as diagnostics, calibration, manual fallback, "what if worse". The shrink cap is defined once in `SKILL.md` |
+| `references/transcript.md` | new, derivative of anti-ai-skill | Written for this fork: spoken-text norms, ASR noise, meta-replies, fact checks |
+| `references/acceptance.md` | new, derivative of anti-ai-skill | Written for this fork: six acceptance questions, report format, stop rule. The detector disclaimer points to `SKILL.md` instead of repeating it |
+| `scripts/check_facts.py` | humanizer-ru 4.4.0, modified copy | Local change: `urllib.parse` replaced with a local `_unquote` helper and a manual query rebuild, including the lower-cased scheme that `urlsplit` provided. Reason: security scanners treat any `urllib` import as network access, which raised a false HIGH. Verified on 15 URL cases and by the upstream test suite |
+| `scripts/clean_paste.py` | humanizer-ru 4.4.0, modified copy | Same local `urllib.parse` replacement and the same 15-case check. The module contract now states exactly what happens inside code: paste invisibles outside string, template and regex literals are removed; no other code character changes. Behaviour is upstream's |
+| `scripts/lint_style.py` | humanizer-ru 4.4.0, verbatim copy | No local edits |
+| `scripts/rules.json` | humanizer-ru 4.4.0, verbatim copy | No local edits |
 | `scripts/diagnose.py` | anti-ai-skill, modified copy | Attribution header, plus four fixes: usage paths `tools/` → `scripts/`, the reference to the unshipped `fix-typography.py` removed, the typography gate narrowed to invisible characters only, and the docstring updated to match |
+| `tests/` | humanizer-ru 4.4.0, modified copy | Paths point to `skill/redaktura-ru/scripts`. Python ↔ JavaScript parity tests are removed. The algorithmic-bounds test uses a 6 s ceiling instead of 4 s; it still catches complexity regressions |
 
-Repository-level files (`README.md`, `NOTICE.md`, `SOURCES.md`, `LICENSE`) are
-new or rewritten for this fork.
+Repository-level files (`README.md`, `NOTICE.md`, `SOURCES.md`, `CHANGELOG.md`,
+`LICENSE`, `tests/README.md`) are new or rewritten for this fork.
 
 ## Deliberate omissions
 
@@ -51,6 +57,14 @@ From anti-ai-skill, these were not carried over:
 - `rules/grep-nabor.md` — duplicates `diagnose.py` and needs a file on disk.
 - `rules/1-diagnostika.md`, `rules/4-ritm.md` — kept only as the source for
   `measure.md`; the five-stage pipeline and paragraph splicing are not adopted.
-- `tools/fix-typography.py` — the base skill has its own typography rules and
-  a second tool would compete with them.
+- `tools/fix-typography.py` — the base skill has its own typography rules
+  and a second tool would compete with them.
 - The five dictionary axes and their zero-tolerance thresholds.
+
+From humanizer-ru 4.4.0, these were not carried over:
+
+- `site/`, `eval/`, `prompt/chat.md`, repository scripts, CI workflows, plugin
+  manifests, `.grace/`, `gemini-extension.json` — upstream distribution
+  infrastructure, not part of the skill.
+- Python ↔ JavaScript parity tests — this repository has no browser copies of
+  the engines.
